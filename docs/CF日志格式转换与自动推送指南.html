@@ -221,7 +221,6 @@ li { margin: 5px 0; font-size: 14px; }
   <div class="badge">Cloudflare Enterprise — 技术参考文档</div>
   <h1>CF Logpush — <span>日志格式转换</span>与自动推送</h1>
   <p>无服务器日志管道 · Cloudflare Workers + R2 + Queues · CDN 合作方日志对接</p>
-  <p style="margin-top:10px; font-size:13px; color:#666;">源代码：<code style="background:rgba(255,255,255,0.08); color:var(--orange);">src/index.js</code> &nbsp;·&nbsp; 配置文件：<code style="background:rgba(255,255,255,0.08); color:var(--orange);">wrangler.toml</code></p>
 </header>
 
 <nav>
@@ -278,44 +277,131 @@ li { margin: 5px 0; font-size: 14px; }
 <section class="section" id="architecture">
   <div class="section-title"><div class="num">2</div>架构设计</div>
 
-  <div class="ascii-flow">  CF 边缘节点（全球 300+ PoP）
-       │
-       │  HTTP 请求日志（约每分钟一批，ndjson.gz）
-       ▼
-  ┌─────────────────────────────┐
-  │  Logpush Job                │  数据集：http_requests
-  │  目的地：R2                 │  时间戳格式：unix
-  │  存储桶：cdn-logs-raw       │  字段：全选
-  └──────────────┬──────────────┘
-                 │  object-create 事件（秒级触发）
-                 ▼
-  ┌─────────────────────────────┐
-  │  parse-queue                │  max_batch_size: 5
-  │  消息内容：R2 对象路径       │  max_retries: 2 → parse-dlq
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────┐
-  │  Parser Worker              │  流式 Gzip 解压
-  │  src/index.js               │  JSON → 145 字段 \u0001 格式
-  │                             │  每 N 行写一个 R2 临时文件
-  └──────────────┬──────────────┘
-                 │  send-queue 消息（R2 临时文件路径）
-                 ▼
-  ┌─────────────────────────────┐
-  │  send-queue                 │  max_batch_size: 20
-  │  消息内容：processed/ 路径  │  max_retries: 5 → send-dlq
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────┐
-  │  Sender Worker              │  读取 R2 → Gzip 压缩
-  │  src/index.js               │  MD5 鉴权 URL → HTTP POST
-  │                             │  200 响应：ack + 删除 R2 临时文件
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-       合作方日志接收服务器</div>
+  <div class="ascii-flow">┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              【第一步】日志的产生                                      │
+│                                                                                     │
+│   用户打开网页 / App                                                                  │
+│          │                                                                           │
+│          ▼                                                                           │
+│   请求到达 Cloudflare 边缘节点（全球300+个城市）                                       │
+│          │                                                                           │
+│          │  CF 记录一条日志：用户IP、时间、URL、响应码、大小、缓存状态、耗时...          │
+│          ▼                                                                           │
+│   CF 边缘处理完请求，日志暂存在 CF 内部系统                                            │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                        每约1分钟，Logpush 自动打包推送
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         【第二步】Logpush 自动推送日志到 R2                            │
+│                                                                                     │
+│   Logpush 服务（全自动，无需人工）：                                                   │
+│   1. 打包过去1分钟的所有日志（ndjson格式，每行一条JSON日志）                             │
+│   2. Gzip 压缩（大幅减小文件体积）                                                    │
+│   3. 写入 R2 存储桶                                                                  │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  R2 Bucket: cdn-logs-raw                │                                      │
+│   │  logs/                                  │                                      │
+│   │  └── 20260328/                          │ ← 按日期自动分目录                    │
+│   │      ├── 20260328T090000Z_xxx.log.gz    │ ← 每文件几KB到几MB                   │
+│   │      ├── 20260328T090100Z_xxx.log.gz    │ ← 文件名含时间戳，全球唯一            │
+│   │      └── ...（每分钟一个新文件）          │                                      │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                   R2 检测到新文件 → 立即触发（秒级）Event Notification
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     【第三步】R2 事件通知 → parse-queue 排队                           │
+│                                                                                     │
+│   R2 Event Notification 自动发送消息到 parse-queue：                                  │
+│   { "bucket": "cdn-logs-raw", "object": { "key": "logs/20260328/xxx.log.gz" } }     │
+│   （消息只有文件路径，几十字节，永远不超128KB限制）                                     │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  Queue: parse-queue（解析任务队列）       │                                      │
+│   │  消息1: { key: "logs/.../a.log.gz" }    │ ← 只是文件路径，不含日志内容           │
+│   │  消息2: { key: "logs/.../b.log.gz" }    │ ← 自动批量、自动重试、自动扩缩容       │
+│   │  ...                                     │                                      │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                       Queue 有消息时自动唤醒 Parser Worker（约3-5秒）
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                  【第四步】Parser Worker — 读取、解压、解析、格式转换                   │
+│                                                                                     │
+│   ① 从 R2 取得 .gz 文件流（不全量下载，只拿到流引用）                                  │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ② 实时解压（DecompressionStream）边读边解压，内存只有当前几KB数据                    │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ③ 按行切割，逐行解析 JSON（每行一条CF原始日志）                                      │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ④ 格式转换（transformEdge函数）                                                     │
+│      CF JSON → \u0001 分隔的145字段纯文本格式                                        │
+│                                                                                     │
+│      转换前：{ "RayID":"9e34...", "ClientIP":"221.229...", "EdgeColoCode":"HGH" }   │
+│      转换后：cs_vod_v3.0\u0001[28/Mar/2026:16:42:25 +0800]\u00019e34...\u0001200   │
+│             \u00011774680145.000\u00010.149\u0001...(共145字段)                     │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ⑤ 每累积300条（或文件处理完）→ 写入 R2 临时文件 + 发消息到 send-queue               │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                              写入 R2 临时文件，发消息
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    【第五步】R2 临时文件 + send-queue 排队                             │
+│                                                                                     │
+│   R2 临时文件（processed/ 目录，已转换为目标格式）：                                   │
+│   processed/logs_20260328_xxx-0-1774683718956.txt  ← 300条日志，纯文本               │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  Queue: send-queue（发送任务队列）        │                                      │
+│   │  消息: { "key": "processed/...txt" }    │ ← 只传文件路径，几十字节               │
+│   │  ...                                     │ ← 发送失败自动重试5次，彻底失败进DLQ  │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                       Queue 有消息时自动唤醒 Sender Worker（约3-5秒）
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   【第六步】Sender Worker — 压缩、签名、发送                           │
+│                                                                                     │
+│   ① 从 R2 读取临时文件（已转换好的300条目标格式日志）                                  │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ② Gzip 压缩 Body（合作方规范要求）                                                  │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ③ 计算 MD5 鉴权签名：                                                              │
+│      ts      = 当前Unix时间 + 300秒                                                  │
+│      rand    = 随机数                                                                │
+│      签名串  = "{uri}-{ts}-{rand}-{私钥}"                                            │
+│      md5hash = MD5(签名串)                                                          │
+│      URL     = {endpoint}{uri}?auth_key={ts}-{rand}-{md5}                          │
+│          │                                                                           │
+│          ▼                                                                           │
+│   ④ HTTP POST 发送到合作方日志接收服务器（Content-Encoding: gzip）                    │
+│          │                                                                           │
+│          ├── 成功(HTTP 200) → ack消息 + 删除R2临时文件 ✅                            │
+│          └── 失败 → retry → 最多5次 → 彻底失败进 send-dlq ⚠️                       │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           【第七步】合作方接收入库                                     │
+│   验证鉴权 → 解压Gzip → 按\u0001拆分145字段 → 写入计费/分析数据库 ✓                  │
+└─────────────────────────────────────────────────────────────────────────────────────┘</div>
 
   <div class="tip tip-info">Queue 消息中仅传递 R2 对象路径（数十字节），从不携带日志内容，彻底规避 Queue 128 KB 消息大小限制。</div>
 </section>
@@ -338,7 +424,7 @@ li { margin: 5px 0; font-size: 14px; }
     <p>Parser 自动识别 <code>EdgeStartTimestamp</code> 的三种格式：Unix 秒整数、Unix 毫秒整数、RFC 3339 字符串。推荐 Logpush 配置 <code>timestamp_format = unix</code> 以保证一致性。</p>
 
     <h4>CDN 节点国家码映射</h4>
-    <p>目标格式要求的是 <em>CDN 节点所在国家</em>（非客户端国家）。<code>EdgeColoCode</code>（IATA 机场三字码，如 <code>NRT</code> = 东京）通过内置映射表转换为 ISO 3166-1 alpha-2 国家码，覆盖全球 200+ 机场。若未命中则回退至 <code>ClientCountry</code>。</p>
+    <p>目标格式要求的是 <em>CDN 节点所在国家</em>（非客户端国家）。<code>EdgeColoCode</code>（IATA 机场三字码，如 <code>NRT</code> = 东京）通过内置映射表转换为 ISO 3166-1 alpha-2 国家码，覆盖全球 200+ 机场。若未命中则默认返回 <code>CN</code>。</p>
 
     <h4>MD5 鉴权</h4>
     <p>Workers 的 <code>SubtleCrypto</code> API 不支持 MD5 算法，因此 <code>src/index.js</code> 内嵌了纯 JS 实现的 RFC 1321 MD5。鉴权 URL 签名格式为：<code>MD5({uri}-{ts}-{rand}-{privateKey})</code>。</p>
@@ -369,22 +455,14 @@ li { margin: 5px 0; font-size: 14px; }
     <tr><td>DLQ 消息数</td><td>0</td><td style="color:var(--green)">零数据丢失</td></tr>
   </table>
 
-  <h3>容量上限</h3>
-  <table>
-    <tr><th>维度</th><th>上限</th><th>评分</th></tr>
-    <tr><td>可靠性（at-least-once + DLQ 兜底）</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>吞吐量（Queues：5,000 msg/s，250 并发）</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>内存占用（流式处理，恒定）</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>运维成本（零服务器）</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>使用成本（Enterprise：R2 + Queues + Workers）</td><td>—</td><td class="stars">★★★★</td></tr>
-  </table>
+
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="deploy">
   <div class="section-title"><div class="num">5</div>部署指南</div>
 
-  <div class="tip tip-warn">前置条件：本地已安装 Node.js v18+；已安装 Wrangler CLI（<code>npm install -g wrangler</code>）；已准备好权限范围为目标账号的 Cloudflare API Token（模板选 Edit Cloudflare Workers）。</div>
+  <div class="tip tip-warn">前置条件：本地已安装 Node.js v18+；已安装 Wrangler CLI（<code>npm install -g wrangler</code>）；已准备好 Cloudflare API Token，权限范围限定为目标账号，需包含以下三项：<strong>Workers Scripts:Edit</strong>、<strong>Workers R2 Storage:Edit</strong>、<strong>Workers Queue:Edit</strong>（可使用 Edit Cloudflare Workers 模板后手动追加后两项）。</div>
   <div class="tip tip-warn">部署前请向日志对接方确认：推送服务器地址（Endpoint）、鉴权私钥（Private Key）、接收 URI 路径（URI Path）。</div>
 
   <div class="step-card">
@@ -585,22 +663,6 @@ wrangler secret list</pre>
     <tr><td>R2 <code>processed/</code> 目录</td><td>无文件积压</td><td>文件积压 → Sender 异常，查看 Worker 日志</td></tr>
   </table>
 
-  <h3>常用命令</h3>
-  <pre><span class="comment"># 查看实时 Worker 日志</span>
-wrangler tail ctyun-logpush
-
-<span class="comment"># 手动部署（CI/CD 之外）</span>
-wrangler deploy
-
-<span class="comment"># 查看已配置的 Secret 列表（不显示值）</span>
-wrangler secret list
-
-<span class="comment"># 轮换某个 Secret</span>
-wrangler secret put CTYUN_PRIVATE_KEY
-
-<span class="comment"># 查看部署历史</span>
-wrangler deployments list</pre>
-
   <h3>配置变更说明</h3>
   <table>
     <tr><th>变更类型</th><th>操作方式</th><th>是否需要重新部署</th></tr>
@@ -614,6 +676,7 @@ wrangler deployments list</pre>
 
 <footer>
   Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN 日志对接技术参考 &nbsp;·&nbsp; 2026
+  <br><a href="mailto:dong@cloudflare.com" style="color:#666; text-decoration:none;">dong@cloudflare.com</a>
 </footer>
 
 </body>

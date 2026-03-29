@@ -221,7 +221,6 @@ li { margin: 5px 0; font-size: 14px; }
   <div class="badge">Cloudflare Enterprise — Technical Reference</div>
   <h1>CF Logpush — <span>Format Transform</span> &amp; Automated Push</h1>
   <p>Serverless log pipeline · Cloudflare Workers + R2 + Queues · CDN Partner Log Integration</p>
-  <p style="margin-top:10px; font-size:13px; color:#666;">Source code: <code style="background:rgba(255,255,255,0.08); color:var(--orange);">src/index.js</code> &nbsp;·&nbsp; Configuration: <code style="background:rgba(255,255,255,0.08); color:var(--orange);">wrangler.toml</code></p>
 </header>
 
 <nav>
@@ -278,45 +277,132 @@ li { margin: 5px 0; font-size: 14px; }
 <section class="section" id="architecture">
   <div class="section-title"><div class="num">2</div>Architecture</div>
 
-  <div class="ascii-flow">  CF Edge (300+ PoPs)
-       │
-       │  HTTP request logs (~1 min batch, ndjson.gz)
-       ▼
-  ┌─────────────────────────────┐
-  │  Logpush Job                │  Dataset: http_requests
-  │  Destination: R2            │  Timestamp: unix
-  │  Bucket: cdn-logs-raw       │  Fields: all
-  └──────────────┬──────────────┘
-                 │  object-create event (seconds)
-                 ▼
-  ┌─────────────────────────────┐
-  │  parse-queue                │  max_batch_size: 5
-  │  (R2 object key only)       │  max_retries: 2 → parse-dlq
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────┐
-  │  Parser Worker              │  Streaming gzip decompress
-  │  src/index.js               │  JSON → 145-field \u0001 format
-  │                             │  Batch every N lines → R2 processed/
-  └──────────────┬──────────────┘
-                 │  send-queue message (R2 key only)
-                 ▼
-  ┌─────────────────────────────┐
-  │  send-queue                 │  max_batch_size: 20
-  │  (processed/ file key)      │  max_retries: 5 → send-dlq
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────┐
-  │  Sender Worker              │  Read R2 → Gzip compress
-  │  src/index.js               │  MD5 auth URL → HTTP POST
-  │                             │  On 200: ack + delete R2 file
-  └──────────────┬──────────────┘
-                 │
-                 ▼
-       Remote Log Endpoint
-       (CDN partner ingestion server)</div>
+  <div class="ascii-flow">┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              [Step 1] Log Generation                                │
+│                                                                                     │
+│   End user opens a webpage / app                                                    │
+│          │                                                                          │
+│          ▼                                                                          │
+│   Request reaches a Cloudflare edge node (300+ cities worldwide)                   │
+│          │                                                                          │
+│          │  CF records one log entry: client IP, timestamp, URL, status code,      │
+│          │  response size, cache status, latency...                                 │
+│          ▼                                                                          │
+│   CF edge processes the request; log entry is buffered in CF internal system       │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                     Every ~1 minute, Logpush automatically batches and pushes
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         [Step 2] Logpush Writes to R2                               │
+│                                                                                     │
+│   Logpush service (fully automated):                                                │
+│   1. Packages all logs from the past ~1 minute (ndjson, one JSON object per line)  │
+│   2. Gzip compresses the file                                                       │
+│   3. Writes to R2 bucket                                                            │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  R2 Bucket: cdn-logs-raw                │                                      │
+│   │  logs/                                  │                                      │
+│   │  └── 20260328/                          │ ← auto-partitioned by date           │
+│   │      ├── 20260328T090000Z_xxx.log.gz    │ ← each file a few KB to a few MB    │
+│   │      ├── 20260328T090100Z_xxx.log.gz    │ ← filename contains timestamp        │
+│   │      └── ... (new file every ~1 min)    │                                      │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                 R2 detects new object → immediately fires Event Notification (seconds)
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     [Step 3] R2 Event Notification → parse-queue                    │
+│                                                                                     │
+│   R2 Event Notification sends a message to parse-queue:                             │
+│   { "bucket": "cdn-logs-raw", "object": { "key": "logs/20260328/xxx.log.gz" } }    │
+│   (Message contains only the file path — a few dozen bytes, never exceeds 128 KB)  │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  Queue: parse-queue                     │                                      │
+│   │  msg 1: { key: "logs/.../a.log.gz" }   │ ← file path only, no log content     │
+│   │  msg 2: { key: "logs/.../b.log.gz" }   │ ← auto-batched, auto-retry           │
+│   │  ...                                    │                                      │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                    Queue wakes up Parser Worker when messages arrive (~3-5 seconds)
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                  [Step 4] Parser Worker — Read, Decompress, Parse, Transform        │
+│                                                                                     │
+│   ① Obtain streaming reference to .gz file from R2 (no full download)              │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ② Stream decompress via DecompressionStream — only a few KB in memory at a time  │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ③ Split by newline, parse each line as JSON (one CF log entry per line)          │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ④ Format transform (transformEdge function)                                       │
+│      CF JSON → \u0001-delimited 145-field plaintext format                         │
+│                                                                                     │
+│      Before: { "RayID":"9e34...", "ClientIP":"221.229...", "EdgeColoCode":"HGH" }  │
+│      After:  cs_vod_v3.0\u0001[28/Mar/2026:16:42:25 +0800]\u00019e34...\u0001200  │
+│              \u00011774680145.000\u00010.149\u0001...(145 fields total)            │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ⑤ Every 300 lines (or end of file) → write R2 temp file + send to send-queue    │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                              Write R2 temp file, enqueue message
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    [Step 5] R2 Temp File + send-queue                               │
+│                                                                                     │
+│   R2 temp file (processed/ directory, already in target format):                   │
+│   processed/logs_20260328_xxx-0-1774683718956.txt  ← 300 log lines, plaintext      │
+│                                                                                     │
+│   ┌─────────────────────────────────────────┐                                      │
+│   │  Queue: send-queue                      │                                      │
+│   │  msg: { "key": "processed/...txt" }    │ ← file path only, a few dozen bytes  │
+│   │  ...                                    │ ← auto-retry up to 5x → send-dlq    │
+│   └─────────────────────────────────────────┘                                      │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                    Queue wakes up Sender Worker when messages arrive (~3-5 seconds)
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   [Step 6] Sender Worker — Compress, Sign, Send                     │
+│                                                                                     │
+│   ① Read temp file from R2 (300 lines in target format)                             │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ② Gzip compress body (required by partner spec)                                   │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ③ Compute MD5 auth signature:                                                     │
+│      ts      = current Unix time + 300s                                             │
+│      rand    = random integer                                                       │
+│      sigstr  = "{uri}-{ts}-{rand}-{privateKey}"                                    │
+│      md5hash = MD5(sigstr)                                                          │
+│      URL     = {endpoint}{uri}?auth_key={ts}-{rand}-{md5}                          │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ④ HTTP POST to partner log ingestion server (Content-Encoding: gzip)             │
+│          │                                                                          │
+│          ├── Success (HTTP 200) → ack message + delete R2 temp file ✅             │
+│          └── Failure → retry → up to 5x → send-dlq on exhaustion ⚠️              │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           [Step 7] Partner Ingestion                                │
+│   Verify auth → Gzip decompress → split on \u0001 → write to billing/analytics DB ✓│
+└─────────────────────────────────────────────────────────────────────────────────────┘</div>
 
   <div class="tip tip-info">Queue messages carry only R2 object keys (a few dozen bytes), never log content. This sidesteps the 128 KB Queue message size limit entirely.</div>
 </section>
@@ -339,7 +425,7 @@ li { margin: 5px 0; font-size: 14px; }
     <p>The parser auto-detects <code>EdgeStartTimestamp</code> in three formats: Unix seconds integer, Unix milliseconds integer, and RFC 3339 string. Logpush is recommended to be configured with <code>timestamp_format = unix</code> for consistency.</p>
 
     <h4>CDN Node Country Mapping</h4>
-    <p>The target format requires the <em>CDN node country</em> (not client country). <code>EdgeColoCode</code> (IATA airport code, e.g. <code>NRT</code> = Tokyo) is mapped to ISO 3166-1 alpha-2 country code via a built-in lookup table covering 200+ airports globally. Falls back to <code>ClientCountry</code> if the IATA code is not in the table.</p>
+    <p>The target format requires the <em>CDN node country</em> (not client country). <code>EdgeColoCode</code> (IATA airport code, e.g. <code>NRT</code> = Tokyo) is mapped to ISO 3166-1 alpha-2 country code via a built-in lookup table covering 200+ airports globally. If the IATA code is not in the table, defaults to <code>CN</code>.</p>
 
     <h4>MD5 Authentication</h4>
     <p>Workers' <code>SubtleCrypto</code> API does not support MD5. A pure-JS RFC 1321 implementation is included in <code>src/index.js</code>. The auth URL signature format is: <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>.</p>
@@ -370,22 +456,14 @@ li { margin: 5px 0; font-size: 14px; }
     <tr><td>DLQ messages</td><td>0</td><td style="color:var(--green)">No data loss</td></tr>
   </table>
 
-  <h3>Capacity</h3>
-  <table>
-    <tr><th>Dimension</th><th>Limit</th><th>Rating</th></tr>
-    <tr><td>Reliability (at-least-once + DLQ)</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>Throughput (Queues: 5,000 msg/s, 250 concurrent)</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>Memory footprint (streaming, constant)</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>Operational overhead (zero-server)</td><td>—</td><td class="stars">★★★★★</td></tr>
-    <tr><td>Cost (Enterprise plan: R2 + Queues + Workers)</td><td>—</td><td class="stars">★★★★</td></tr>
-  </table>
+
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="deploy">
   <div class="section-title"><div class="num">5</div>Deployment Guide</div>
 
-  <div class="tip tip-warn">Prerequisites: Node.js v18+ installed locally. Wrangler CLI installed (<code>npm install -g wrangler</code>). A Cloudflare API Token with <strong>Edit Cloudflare Workers</strong> permissions scoped to the target account.</div>
+  <div class="tip tip-warn">Prerequisites: Node.js v18+ installed locally. Wrangler CLI installed (<code>npm install -g wrangler</code>). A Cloudflare API Token scoped to the target account with the following permissions: <strong>Workers Scripts:Edit</strong>, <strong>Workers R2 Storage:Edit</strong>, and <strong>Workers Queue:Edit</strong> (use the Edit Cloudflare Workers template and manually add the R2 and Queue permissions).</div>
   <div class="tip tip-warn">Before deploying, obtain from your log ingestion partner: server endpoint URL, authentication private key, and the target URI path.</div>
 
   <div class="step-card">
@@ -586,22 +664,6 @@ wrangler secret list</pre>
     <tr><td>R2 <code>processed/</code></td><td>No file accumulation</td><td>Files accumulating → Sender not consuming; check Worker logs</td></tr>
   </table>
 
-  <h3>Common Commands</h3>
-  <pre><span class="comment"># Stream live Worker logs</span>
-wrangler tail ctyun-logpush
-
-<span class="comment"># Manual deploy (outside of CI/CD)</span>
-wrangler deploy
-
-<span class="comment"># List configured secrets (values not shown)</span>
-wrangler secret list
-
-<span class="comment"># Rotate a secret</span>
-wrangler secret put CTYUN_PRIVATE_KEY
-
-<span class="comment"># View deployment history</span>
-wrangler deployments list</pre>
-
   <h3>Updating Secrets vs. Variables</h3>
   <table>
     <tr><th>Change Type</th><th>Method</th><th>Redeploy Required?</th></tr>
@@ -615,6 +677,7 @@ wrangler deployments list</pre>
 
 <footer>
   Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN Log Integration Reference &nbsp;·&nbsp; 2026
+  <br><a href="mailto:dong@cloudflare.com" style="color:#666; text-decoration:none;">dong@cloudflare.com</a>
 </footer>
 
 </body>
