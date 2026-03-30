@@ -511,6 +511,10 @@ li { margin: 5px 0; font-size: 14px; }
     <tr><td>★★</td><td>Consumer Lag Time (parse-queue)</td><td>Sustained &gt; 5 minutes</td></tr>
     <tr><td>★★</td><td>5xx subrequests rate</td><td>&gt; 0.5% of total</td></tr>
     <tr><td>★★</td><td>send-queue Consumer Concurrency</td><td>Sustained &gt; 200</td></tr>
+  </table>
+
+  <h3>Performance Optimization Recommendations</h3>
+  <div class="card">
     <tr><td>★</td><td>P99 CPU Time</td><td>&gt; 20s</td></tr>
   </table>
 
@@ -807,35 +811,11 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
     <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>System consuming in real time</td><td>Healthy — no action needed</td></tr>
     <tr><td>Backlog growing continuously</td><td>Consumption falling behind production — genuine bottleneck</td><td>Check Worker errors; scale if needed</td></tr>
-    <tr><td>Exceeded CPU Time Limits &gt; 0</td><td>Individual Logpush file too large for single Worker invocation</td><td>Reduce Logpush <code>max_upload_records</code>; do NOT reduce <code>max_batch_size</code></td></tr>
+    <tr><td>Exceeded CPU Time Limits &gt; 0</td><td>Individual Logpush file too large for single Worker invocation</td><td>Monitor frequency; contact CF support if increasing; do NOT reduce <code>max_batch_size</code></td></tr>
     <tr><td>Messages Retried &gt; 0</td><td>Partner endpoint instability</td><td>Investigate 5xx subrequests; confirm endpoint capacity</td></tr>
     <tr><td>DLQ &gt; 0</td><td>Data loss risk — highest priority</td><td>Inspect DLQ messages immediately; manually reprocess from R2</td></tr>
     <tr><td>send-queue Concurrency &gt; 200</td><td>Near the 250 concurrent consumer limit</td><td>Increase <code>max_batch_size</code> for send-queue; request quota increase if needed</td></tr>
   </table>
-
-  <h3>Performance Optimization Recommendations</h3>
-  <div class="card">
-    <h4>1. Enable Smart Placement (Recommended)</h4>
-    <p>Smart Placement automatically runs the Worker at the CF data center closest to R2 and the partner endpoint, reducing network round-trip time. Expected to reduce Wall Time P99 by 20–40%.</p>
-    <p><strong>Option A — via Dashboard:</strong> Workers &amp; Pages → ctyun-logpush → <strong>Settings → General → Placement → select Smart</strong></p>
-    <p><strong>Option B — via wrangler.toml</strong> (add to the file and redeploy):</p>
-    <pre>[placement]
-mode = "smart"</pre>
-    <p>Official docs: <a href="https://developers.cloudflare.com/workers/configuration/smart-placement/" style="color:var(--blue)">developers.cloudflare.com/workers/configuration/smart-placement</a></p>
-    <div class="tip tip-info">Smart Placement only affects fetch event handlers. It does not apply to queue consumers. For this Worker (queue-driven only), the benefit is limited — evaluate after enabling.</div>
-
-    <h4>2. send-queue max_batch_size (Already set to 50)</h4>
-    <p>Increasing <code>max_batch_size</code> for send-queue from 20 to 50 reduces peak concurrency from ~220 to ~90, providing substantial headroom before the 250 concurrent consumer limit. This is already reflected in <code>wrangler.toml</code>. No changes required to <code>src/index.js</code>.</p>
-
-    <h4>3. CPU Exceeded events — root cause and mitigation</h4>
-    <p>The root cause of <code>Exceeded CPU Time Limits</code> is individual Logpush files growing very large during traffic bursts (single file may contain tens of thousands of log lines). Cloudflare's <code>output_options</code> does not currently expose a <code>max_upload_records</code> parameter — see <a href="https://developers.cloudflare.com/logs/logpush/logpush-job/log-output-options/" style="color:var(--blue)">Log Output Options</a> for available parameters.</p>
-    <p>Current mitigation options:</p>
-    <ul style="font-size:14px; margin:8px 0 8px 20px;">
-      <li>Monitor frequency: 3 occurrences per 6-hour window at current traffic is acceptable</li>
-      <li>If frequency increases significantly, contact Cloudflare support to explore per-zone Logpush file size limits</li>
-      <li>Do <strong>not</strong> reduce parse-queue <code>max_batch_size</code> — it does not address the root cause and increases lag</li>
-    </ul>
-  </div>
 
   <h3>Updating Secrets vs. Variables</h3>
   <table>

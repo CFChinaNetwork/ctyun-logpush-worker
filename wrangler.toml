@@ -43,9 +43,3 @@ preview_urls = false
 enabled = true
 invocation_logs = true
 
-# Smart Placement — optional, reduces Wall Time by placing Worker near R2/partner endpoint
-# Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/
-# Note: only affects fetch handlers; limited benefit for this queue-driven Worker
-# Uncomment to enable:
-# [placement]
-# mode = "smart"
