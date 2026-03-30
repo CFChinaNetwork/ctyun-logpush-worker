@@ -232,7 +232,7 @@ async function tryParse(line, onRecord) {
 //   #10 finalize_error:    nginx/ATS特有字段，CF无对应，固定'-'
 //   #12 server_port:       ClientRequestScheme→https:443 / http:80
 //   #19 server_protocol:   ClientRequestProtocol完整值，如 HTTP/1.1
-//   #21 sent_http_content_length: ResponseHeaders['content-length']（需配置Custom Fields），回退→EdgeResponseBodyBytes
+//   #21 sent_http_content_length: ResponseHeaders['content-length'] → EdgeResponseBodyBytes(非0) → EdgeResponseBytes
 //   #27 cache_status:      CacheCacheStatus: hit/stale/revalidated/updating→HIT, miss/expired/bypass/dynamic/none→MISS
 //   #28 cache_status2:     同#27
 //   #36 http_x_forwarded_for: CF无XFF header，用ClientIP近似
@@ -365,14 +365,17 @@ function finalizeErrorCode(r) {
 }
 
 // #21 sent_http_content_length: 响应头Content-Length
-// CF没有直接暴露Content-Length响应头字段
-// 如已配置Custom Fields(ResponseHeaders包含content-length)，从ResponseHeaders取值
-// 否则回退到EdgeResponseBodyBytes
+// 优先: ResponseHeaders['content-length']（需配置Logpush Custom Fields）
+// 回退1: EdgeResponseBodyBytes（响应体字节数）
+// 回退2: EdgeResponseBytes（含响应头的总字节数）
 function responseContentLength(r) {
   if (r.ResponseHeaders && r.ResponseHeaders['content-length']) {
     return sf(r.ResponseHeaders['content-length']);
   }
-  return sf(r.EdgeResponseBodyBytes);
+  if (r.EdgeResponseBodyBytes != null && r.EdgeResponseBodyBytes !== 0) {
+    return sf(r.EdgeResponseBodyBytes);
+  }
+  return sf(r.EdgeResponseBytes);
 }
 function mapCache(s) {
   if (!s) return '-';
