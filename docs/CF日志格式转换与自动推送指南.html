@@ -816,26 +816,24 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
   <div class="card">
     <h4>1. 开启 Smart Placement（推荐）</h4>
     <p>Smart Placement 让 Worker 自动运行在离 R2 存储桶和接收端最近的 CF 数据中心，减少网络往返时间。预计 Wall Time P99 可降低 20–40%。</p>
-    <p><strong>操作路径：</strong>Workers → ctyun-logpush → Settings → Smart Placement → Enable</p>
+    <p><strong>方式 A — Dashboard 操作：</strong>Workers &amp; Pages → ctyun-logpush → <strong>Settings → General → Placement → 选择 Smart</strong></p>
+    <p><strong>方式 B — wrangler.toml</strong>（添加后重新部署）：</p>
+    <pre>[placement]
+mode = "smart"</pre>
+    <p>官方文档：<a href="https://developers.cloudflare.com/workers/configuration/smart-placement/" style="color:var(--blue)">developers.cloudflare.com/workers/configuration/smart-placement</a></p>
+    <div class="tip tip-info">Smart Placement 仅对 fetch 事件处理器生效，不影响 Queue 消费者。本 Worker 为纯 Queue 驱动，实际收益有限，建议开启后观察效果。</div>
 
     <h4>2. send-queue max_batch_size（已调整为 50）</h4>
-    <p>将 send-queue 的 <code>max_batch_size</code> 从 20 提高到 50，可将峰值并发从约 220 降低到约 90，在 250 并发上限前留出充足余量。此项已在 <code>wrangler.toml</code> 中生效。</p>
+    <p>将 send-queue 的 <code>max_batch_size</code> 从 20 提高到 50，可将峰值并发从约 220 降低到约 90，在 250 并发上限前留出充足余量。此项已在 <code>wrangler.toml</code> 中生效，<code>src/index.js</code> 无需修改。</p>
 
-    <h4>3. 通过 max_upload_records 控制 Logpush 文件大小（解决 CPU 超限）</h4>
-    <p>CPU Time Exceeded 的根本原因是流量峰值时单个 Logpush 文件过大。通过 API 限制每个文件最大记录数，可使单次调用 CPU 时间可控：</p>
-    <pre><span class="comment"># 更新 Logpush Job，限制每个文件最多 5000 条记录</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "output_options": {
-      "max_upload_records": 5000
-    }
-  }'</pre>
-    <div class="tip tip-info">不要通过降低 parse-queue 的 <code>max_batch_size</code> 来解决 CPU 超限问题。降低该值只会减少单次处理的文件数量，对单文件过大这一根本原因没有任何作用，反而会增加 lag。</div>
-
-    <h4>4. parse-queue max_batch_timeout 调整（减少峰值 lag）</h4>
-    <p>将 <code>max_batch_timeout</code> 从 10s 降低到 5s，可让队列在流量突发时更及时地触发消费，降低峰值 lag。</p>
+    <h4>3. CPU 超限事件 — 根因分析与缓解措施</h4>
+    <p>CPU Time Exceeded 的根本原因是流量峰值时单个 Logpush 文件过大（单文件可能包含数万条日志）。Cloudflare 的 <code>output_options</code> 目前没有 <code>max_upload_records</code> 参数，可用参数详见 <a href="https://developers.cloudflare.com/logs/logpush/logpush-job/log-output-options/" style="color:var(--blue)">Log Output Options 官方文档</a>。</p>
+    <p>当前缓解措施：</p>
+    <ul style="font-size:14px; margin:8px 0 8px 20px;">
+      <li>持续监控频率：当前 6 小时内 3 次属于可接受范围</li>
+      <li>若频率明显上升，可联系 Cloudflare 支持探索 Zone 级别的 Logpush 文件大小限制</li>
+      <li><strong>不要</strong>降低 parse-queue 的 <code>max_batch_size</code> — 对单文件过大这一根本原因无效，反而增加 lag</li>
+    </ul>
   </div>
 
   <h3>配置变更说明</h3>

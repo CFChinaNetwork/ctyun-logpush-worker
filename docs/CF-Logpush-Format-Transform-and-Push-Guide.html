@@ -817,26 +817,24 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
   <div class="card">
     <h4>1. Enable Smart Placement (Recommended)</h4>
     <p>Smart Placement automatically runs the Worker at the CF data center closest to R2 and the partner endpoint, reducing network round-trip time. Expected to reduce Wall Time P99 by 20–40%.</p>
-    <p><strong>How to enable:</strong> Workers → ctyun-logpush → Settings → Smart Placement → Enable</p>
+    <p><strong>Option A — via Dashboard:</strong> Workers &amp; Pages → ctyun-logpush → <strong>Settings → General → Placement → select Smart</strong></p>
+    <p><strong>Option B — via wrangler.toml</strong> (add to the file and redeploy):</p>
+    <pre>[placement]
+mode = "smart"</pre>
+    <p>Official docs: <a href="https://developers.cloudflare.com/workers/configuration/smart-placement/" style="color:var(--blue)">developers.cloudflare.com/workers/configuration/smart-placement</a></p>
+    <div class="tip tip-info">Smart Placement only affects fetch event handlers. It does not apply to queue consumers. For this Worker (queue-driven only), the benefit is limited — evaluate after enabling.</div>
 
     <h4>2. send-queue max_batch_size (Already set to 50)</h4>
-    <p>Increasing <code>max_batch_size</code> for send-queue from 20 to 50 reduces peak concurrency from ~220 to ~90, providing substantial headroom before the 250 concurrent consumer limit. This is already reflected in <code>wrangler.toml</code>.</p>
+    <p>Increasing <code>max_batch_size</code> for send-queue from 20 to 50 reduces peak concurrency from ~220 to ~90, providing substantial headroom before the 250 concurrent consumer limit. This is already reflected in <code>wrangler.toml</code>. No changes required to <code>src/index.js</code>.</p>
 
-    <h4>3. Limit Logpush file size via max_upload_records (For CPU Exceeded events)</h4>
-    <p>The root cause of <code>Exceeded CPU Time Limits</code> is individual Logpush files growing too large during traffic bursts. Limit maximum records per file to keep single-invocation CPU time predictable:</p>
-    <pre><span class="comment"># Update Logpush job to cap file size</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "output_options": {
-      "max_upload_records": 5000
-    }
-  }'</pre>
-    <div class="tip tip-info">Do NOT reduce parse-queue <code>max_batch_size</code> to address CPU exceeded events. Lower values reduce throughput and increase lag without fixing the root cause (file size).</div>
-
-    <h4>4. parse-queue max_batch_timeout (For lag reduction)</h4>
-    <p>Reducing <code>max_batch_timeout</code> from 10s to 5s makes the queue consume more promptly during traffic bursts, reducing peak lag.</p>
+    <h4>3. CPU Exceeded events — root cause and mitigation</h4>
+    <p>The root cause of <code>Exceeded CPU Time Limits</code> is individual Logpush files growing very large during traffic bursts (single file may contain tens of thousands of log lines). Cloudflare's <code>output_options</code> does not currently expose a <code>max_upload_records</code> parameter — see <a href="https://developers.cloudflare.com/logs/logpush/logpush-job/log-output-options/" style="color:var(--blue)">Log Output Options</a> for available parameters.</p>
+    <p>Current mitigation options:</p>
+    <ul style="font-size:14px; margin:8px 0 8px 20px;">
+      <li>Monitor frequency: 3 occurrences per 6-hour window at current traffic is acceptable</li>
+      <li>If frequency increases significantly, contact Cloudflare support to explore per-zone Logpush file size limits</li>
+      <li>Do <strong>not</strong> reduce parse-queue <code>max_batch_size</code> — it does not address the root cause and increases lag</li>
+    </ul>
   </div>
 
   <h3>Updating Secrets vs. Variables</h3>
