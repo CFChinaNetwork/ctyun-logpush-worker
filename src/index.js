@@ -226,17 +226,21 @@ async function tryParse(line, onRecord) {
 // ─── 格式转换: CF http_requests → CDN partner log format v3.0（145字段）─────────
 //
 // 字段说明:
-//   #7  rwt_time:    OriginResponseHeaderReceiveDurationMs / 1000
-//   #8  wwt_time:    OriginRequestHeaderSendDurationMs / 1000
-//   #9  fbt_time:    EdgeTimeToFirstByteMs / 1000，秒格式 0.999
-//   #19 server_protocol: 去掉 HTTP/ 前缀，仅保留版本号
+//   #7  rwt_time:          OriginResponseHeaderReceiveDurationMs / 1000
+//   #8  wwt_time:          OriginRequestHeaderSendDurationMs / 1000
+//   #9  fbt_time:          EdgeTimeToFirstByteMs / 1000，秒格式 0.999
+//   #10 finalize_error:    CF EdgePathingStatus无对应语义，固定'-'
+//   #12 server_port:       ClientRequestScheme→https:443 / http:80
+//   #19 server_protocol:   ClientRequestProtocol完整值，如 HTTP/1.1
+//   #27 cache_status:      CacheCacheStatus: hit/stale/revalidated→HIT, miss/expired/bypass/dynamic→MISS
+//   #28 cache_status2:     同#27
 //   #36 http_x_forwarded_for: CF无XFF header，用ClientIP近似
-//   #42 dysta:       CacheCacheStatus: hit→static, dynamic→dynamic, 其他→-
-//   #44 ssl_connect_time: OriginTLSHandshakeDurationMs / 1000
-//   #45 country:     EdgeColoCode→IATA映射→国家码，fallback→ClientCountry→CN
+//   #42 dysta:             CacheCacheStatus: hit→static, dynamic→dynamic, 其他→-
+//   #44 ssl_connect_time:  OriginTLSHandshakeDurationMs / 1000
+//   #45 country:           EdgeColoCode→IATA映射→国家码，未命中→CN
 //   #55 request_start_time: 无方括号的北京时间
-//   #60 servername:  ClientRequestHost
-//   #62 ssl_protocol: ClientSSLProtocol
+//   #60 servername:        ClientRequestHost
+//   #62 ssl_protocol:      ClientSSLProtocol
 function sf(val, maxLen) {
   if (val == null || val === '') return '-';
   const s = String(val);
@@ -253,18 +257,18 @@ function transformEdge(r) {
     /* 7  */ fmtSec(r.OriginResponseHeaderReceiveDurationMs),
     /* 8  */ fmtSec(r.OriginRequestHeaderSendDurationMs),
     /* 9  */ fmtSec(r.EdgeTimeToFirstByteMs),
-    /* 10 */ sf(r.EdgePathingStatus),
+    /* 10 */ '-',
     /* 11 */ sf(r.EdgeServerIP),
-    /* 12 */ '-',
+    /* 12 */ schemeToPort(r.ClientRequestScheme),
     /* 13 */ sf(r.ClientIP),
     /* 14 */ sf(r.ClientSrcPort),
     /* 15 */ sf(r.ClientRequestMethod),
     /* 16 */ sf(r.ClientRequestScheme),
     /* 17 */ sf(r.ClientRequestHost),
     /* 18 */ sf(buildFullUrl(r), MAX_URL_LEN),
-    /* 19 */ extractHttpVersion(r.ClientRequestProtocol),
+    /* 19 */ sf(r.ClientRequestProtocol),
     /* 20 */ sf(r.ClientRequestBytes),
-    /* 21 */ sf(r.EdgeResponseBodyBytes),
+    /* 21 */ sf(r.EdgeResponseContentLength ?? r.EdgeResponseBodyBytes),
     /* 22 */ sf(r.EdgeResponseBytes),
     /* 23 */ sf(r.EdgeResponseBodyBytes),
     /* 24 */ sf(r.OriginIP),
@@ -352,10 +356,18 @@ function extractHttpVersion(protocol) {
   if (!protocol) return '-';
   return protocol.replace(/^HTTP\//i, '') || '-';
 }
+function schemeToPort(scheme) {
+  if (!scheme) return '-';
+  return scheme.toLowerCase() === 'https' ? '443' : '80';
+}
 function mapCache(s) {
   if (!s) return '-';
-  const u = s.toUpperCase();
-  return u === 'HIT' ? 'HIT' : u === 'MISS' ? 'MISS' : '-';
+  const l = s.toLowerCase();
+  // CF CacheCacheStatus values that represent a cache hit
+  if (['hit','stale','revalidated','updating'].includes(l)) return 'HIT';
+  // CF CacheCacheStatus values that represent a cache miss
+  if (['miss','expired','bypass','dynamic','none'].includes(l)) return 'MISS';
+  return '-';
 }
 function mapDysta(s) {
   if (!s) return '-';
