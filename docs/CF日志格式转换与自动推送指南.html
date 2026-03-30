@@ -806,26 +806,11 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><th>信号</th><th>含义</th><th>处理方式</th></tr>
     <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>系统实时消化，运行健康</td><td>正常，无需操作</td></tr>
     <tr><td>Backlog 持续增长</td><td>消费速度跟不上生产速度，真正的瓶颈信号</td><td>检查 Worker 错误日志；必要时扩容</td></tr>
-    <tr><td>CPU Time Exceeded &gt; 0</td><td>单个 Logpush 文件过大，单次调用 CPU 超限</td><td>持续监控频率；频率明显上升时联系 CF 支持；<strong>不要</strong>降低 <code>max_batch_size</code></td></tr>
+    <tr><td>CPU Time Exceeded &gt; 0</td><td>单个 Logpush 文件过大，单次调用 CPU 超限</td><td>持续监控频率；<strong>不要</strong>降低 <code>max_batch_size</code></td></tr>
     <tr><td>Messages Retried &gt; 0</td><td>接收端不稳定</td><td>排查 5xx 子请求；确认接收端容量</td></tr>
     <tr><td>DLQ &gt; 0</td><td>有数据丢失风险，最高优先级</td><td>立即检查 DLQ 消息；从 R2 手动补传</td></tr>
-    <tr><td>send-queue 并发 &gt; 200</td><td>接近 250 并发上限</td><td>提高 send-queue <code>max_batch_size</code>；必要时申请配额提升</td></tr>
+    <tr><td>send-queue 并发 &gt; 200</td><td>接近 250 并发上限</td><td>提高 send-queue <code>max_batch_size</code></td></tr>
   </table>
-
-  <h3>性能优化建议</h3>
-  <div class="card">
-    <h4>1. send-queue max_batch_size（已调整为 50）</h4>
-    <p>将 send-queue 的 <code>max_batch_size</code> 从 20 提高到 50，可将峰值并发从约 220 降低到约 90，在 250 并发上限前留出充足余量。此项已在 <code>wrangler.toml</code> 中生效，<code>src/index.js</code> 无需修改。</p>
-
-    <h4>3. CPU 超限事件 — 根因分析与缓解措施</h4>
-    <p>CPU Time Exceeded 的根本原因是流量峰值时单个 Logpush 文件过大（单文件可能包含数万条日志）。Cloudflare 的 <code>output_options</code> 目前没有 <code>max_upload_records</code> 参数，可用参数详见 <a href="https://developers.cloudflare.com/logs/logpush/logpush-job/log-output-options/" style="color:var(--blue)">Log Output Options 官方文档</a>。</p>
-    <p>当前缓解措施：</p>
-    <ul style="font-size:14px; margin:8px 0 8px 20px;">
-      <li>持续监控频率：当前 6 小时内 3 次属于可接受范围</li>
-      <li>若频率明显上升，可联系 Cloudflare 支持探索 Zone 级别的 Logpush 文件大小限制</li>
-      <li><strong>不要</strong>降低 parse-queue 的 <code>max_batch_size</code> — 对单文件过大这一根本原因无效，反而增加 lag</li>
-    </ul>
-  </div>
 
   <h3>配置变更说明</h3>
   <table>
