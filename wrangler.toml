@@ -31,7 +31,7 @@ max_retries = 5
 dead_letter_queue = "send-dlq"
 
 [vars]
-BATCH_SIZE = "300"
+BATCH_SIZE = "1000"
 LOG_LEVEL  = "info"
 
 
