@@ -229,7 +229,7 @@ async function tryParse(line, onRecord) {
 //   #7  rwt_time:          OriginResponseHeaderReceiveDurationMs / 1000
 //   #8  wwt_time:          OriginRequestHeaderSendDurationMs / 1000
 //   #9  fbt_time:          EdgeTimeToFirstByteMs / 1000，秒格式 0.999
-//   #10 finalize_error:    status=0→'1'(客户端断开), 无status→'4'(超时), 正常→'0'
+//   #10 finalize_error:    nginx/ATS特有字段，CF无对应，固定'-'
 //   #12 server_port:       ClientRequestScheme→https:443 / http:80
 //   #19 server_protocol:   ClientRequestProtocol完整值，如 HTTP/1.1
 //   #27 cache_status:      CacheCacheStatus: hit/stale/revalidated→HIT, miss/expired/bypass/dynamic→MISS
@@ -361,13 +361,10 @@ function schemeToPort(scheme) {
   return scheme.toLowerCase() === 'https' ? '443' : '80';
 }
 
-// #10 finalize_error_code: CF没有直接对应的连接中断错误码字段
-// 用EdgeResponseStatus推断：正常响应→0，无响应(源站错误/超时)→4，ClientDisconnected→1
+// #10 finalize_error_code: 该字段为nginx/ATS架构特有的连接中断错误码
+// CF边缘架构无对应字段，无法准确映射，固定返回'-'
 function finalizeErrorCode(r) {
-  const status = r.EdgeResponseStatus;
-  if (!status) return '4';                          // 无响应状态，推断为写超时/连接中断
-  if (status === 0) return '1';                     // 状态码为0通常表示客户端提前断开
-  return '0';                                       // 正常完成请求
+  return '-';
 }
 
 // #21 sent_http_content_length: 响应头Content-Length
