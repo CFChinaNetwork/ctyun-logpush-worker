@@ -431,13 +431,8 @@ li { margin: 5px 0; font-size: 14px; }
     <p>Workers' <code>SubtleCrypto</code> API does not support MD5. A pure-JS RFC 1321 implementation is included in <code>src/index.js</code>. The auth URL signature format is: <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>.</p>
 
     <h4>Response Content-Length (Field #21)</h4>
-    <p>The <code>http_requests</code> dataset does not expose a dedicated <code>Content-Length</code> field. The Worker resolves field #21 using a three-level fallback:</p>
-    <ol style="margin:8px 0 8px 20px; font-size:14px;">
-      <li><strong>ResponseHeaders['content-length']</strong> — most accurate; requires Logpush Custom Fields to be configured via API (see Step 6b in Deployment)</li>
-      <li><strong>EdgeResponseBodyBytes</strong> — actual response body bytes; used when Custom Fields are not configured or the header is absent (e.g. HTTP/2, gzip-encoded responses)</li>
-      <li><strong>EdgeResponseBytes</strong> — total bytes including response headers; final fallback when EdgeResponseBodyBytes is zero</li>
-    </ol>
-    <div class="tip tip-info">Custom Fields configuration for <code>content-length</code> is optional. The Worker functions correctly without it using the fallback chain above.</div>
+    <p>The <code>http_requests</code> dataset does not expose a dedicated <code>Content-Length</code> field. Field #21 is populated from <code>ResponseHeaders['content-length']</code> when Logpush Custom Fields are configured via API (see Step 6b in Deployment). If not configured or the header is absent, the field returns <code>-</code>.</p>
+    <div class="tip tip-info">Custom Fields configuration for <code>content-length</code> is optional. Without it, field #21 will consistently output <code>-</code>, which is the standard placeholder for unavailable fields in this format.</div>
   </div>
 
   <h3>Reliability Model</h3>
@@ -634,7 +629,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     }
   }'</pre>
       <div class="tip tip-success">Once configured, <code>ResponseHeaders</code> in each log line will contain <code>{"content-length": "12345"}</code> and the Worker will automatically use it for field #21.</div>
-      <div class="tip tip-info">Note: For HTTP/2 responses or gzip-compressed responses, CF may omit <code>Content-Length</code> and use chunked transfer encoding instead. In those cases the Worker falls back to <code>EdgeResponseBodyBytes</code> automatically.</div>
+      <div class="tip tip-info">Note: For HTTP/2 responses or gzip-compressed responses, CF may omit <code>Content-Length</code> and use chunked transfer encoding instead. In those cases field #21 will output <code>-</code>.</div>
     </div>
   </div>
 

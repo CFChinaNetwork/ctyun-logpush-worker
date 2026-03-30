@@ -430,13 +430,8 @@ li { margin: 5px 0; font-size: 14px; }
     <p>Workers 的 <code>SubtleCrypto</code> API 不支持 MD5 算法，因此 <code>src/index.js</code> 内嵌了纯 JS 实现的 RFC 1321 MD5。鉴权 URL 签名格式为：<code>MD5({uri}-{ts}-{rand}-{privateKey})</code>。</p>
 
     <h4>响应内容长度字段（#21 sent_http_content_length）</h4>
-    <p><code>http_requests</code> 数据集没有直接暴露 <code>Content-Length</code> 字段。Worker 对字段 #21 采用三级回退策略：</p>
-    <ol style="margin:8px 0 8px 20px; font-size:14px;">
-      <li><strong>ResponseHeaders['content-length']</strong> — 最准确；需通过 API 配置 Logpush Custom Fields（见部署步骤 6b）</li>
-      <li><strong>EdgeResponseBodyBytes</strong> — 实际响应体字节数；未配置 Custom Fields 或响应头不含该字段时（如 HTTP/2、gzip 压缩响应）使用</li>
-      <li><strong>EdgeResponseBytes</strong> — 含响应头的总字节数；EdgeResponseBodyBytes 为零时的最终兜底</li>
-    </ol>
-    <div class="tip tip-info">Content-Length 的 Custom Fields 配置是可选项。不配置时 Worker 通过上述回退链正常运行。</div>
+    <p><code>http_requests</code> 数据集没有直接暴露 <code>Content-Length</code> 字段。字段 #21 从 <code>ResponseHeaders['content-length']</code> 取值，需通过 API 配置 Logpush Custom Fields（见部署步骤 6b）。未配置或响应头中不含该字段时，统一返回 <code>-</code>。</p>
+    <div class="tip tip-info">Content-Length 的 Custom Fields 配置是可选项。不配置时字段 #21 固定输出 <code>-</code>，与该格式中其他无数据字段的处理方式一致。</div>
   </div>
 
   <h3>可靠性模型</h3>
@@ -633,7 +628,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     }
   }'</pre>
       <div class="tip tip-success">配置完成后，每条日志的 <code>ResponseHeaders</code> 字段将包含 <code>{"content-length": "12345"}</code>，Worker 自动将其用于字段 #21。</div>
-      <div class="tip tip-info">注意：HTTP/2 响应或 CF 开启 gzip 压缩时，源站可能不发送 <code>Content-Length</code> 头（改用 chunked transfer encoding），此时 Worker 自动回退至 <code>EdgeResponseBodyBytes</code>。</div>
+      <div class="tip tip-info">注意：HTTP/2 响应或 CF 开启 gzip 压缩时，源站可能不发送 <code>Content-Length</code> 头（改用 chunked transfer encoding），此时字段 #21 输出 <code>-</code>。</div>
     </div>
   </div>
 
