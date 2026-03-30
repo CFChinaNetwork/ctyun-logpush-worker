@@ -353,7 +353,7 @@ li { margin: 5px 0; font-size: 14px; }
 │              \u00011774680145.000\u00010.149\u0001...(145 fields total)            │
 │          │                                                                          │
 │          ▼                                                                          │
-│   ⑤ Every 300 lines (or end of file) → write R2 temp file + send to send-queue    │
+│   ⑤ Every 1000 lines (or end of file) → write R2 temp file + send to send-queue   │
 └───────────────────────────────────────┬─────────────────────────────────────────────┘
                                         │
                               Write R2 temp file, enqueue message
@@ -363,7 +363,7 @@ li { margin: 5px 0; font-size: 14px; }
 │                    [Step 5] R2 Temp File + send-queue                               │
 │                                                                                     │
 │   R2 temp file (processed/ directory, already in target format):                   │
-│   processed/logs_20260328_xxx-0-1774683718956.txt  ← 300 log lines, plaintext      │
+│   processed/logs_20260328_xxx-0-1774683718956.txt  ← up to 1000 log lines          │
 │                                                                                     │
 │   ┌─────────────────────────────────────────┐                                      │
 │   │  Queue: send-queue                      │                                      │
@@ -378,7 +378,7 @@ li { margin: 5px 0; font-size: 14px; }
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                   [Step 6] Sender Worker — Compress, Sign, Send                     │
 │                                                                                     │
-│   ① Read temp file from R2 (300 lines in target format)                             │
+│   ① Read temp file from R2 (up to 1000 lines in target format)                      │
 │          │                                                                          │
 │          ▼                                                                          │
 │   ② Gzip compress body (required by partner spec)                                   │
@@ -606,7 +606,7 @@ wrangler secret list</pre>
 <span class="key">dead_letter_queue</span>  = <span class="str">"send-dlq"</span>
 
 [vars]
-<span class="key">BATCH_SIZE</span> = <span class="str">"300"</span>   <span class="comment"># Lines per HTTP POST batch</span>
+<span class="key">BATCH_SIZE</span> = <span class="str">"1000"</span>  <span class="comment"># Lines per HTTP POST batch</span>
 <span class="key">LOG_LEVEL</span>  = <span class="str">"info"</span>  <span class="comment"># debug | info | warn | error</span>
 
 <span class="key">workers_dev</span>  = false
@@ -632,8 +632,8 @@ wrangler secret list</pre>
     </tr>
     <tr>
       <td>BATCH_SIZE</td><td>Var</td>
-      <td>300</td>
-      <td>Number of log lines per POST batch. Keep ≤ 500 to stay within payload limits.</td>
+      <td>1000</td>
+      <td>Number of log lines per POST batch.</td>
     </tr>
     <tr>
       <td>LOG_LEVEL</td><td>Var</td>

@@ -352,7 +352,7 @@ li { margin: 5px 0; font-size: 14px; }
 │             \u00011774680145.000\u00010.149\u0001...(共145字段)                     │
 │          │                                                                           │
 │          ▼                                                                           │
-│   ⑤ 每累积300条（或文件处理完）→ 写入 R2 临时文件 + 发消息到 send-queue               │
+│   ⑤ 每累积1000条（或文件处理完）→ 写入 R2 临时文件 + 发消息到 send-queue              │
 └───────────────────────────────────────┬─────────────────────────────────────────────┘
                                         │
                               写入 R2 临时文件，发消息
@@ -362,7 +362,7 @@ li { margin: 5px 0; font-size: 14px; }
 │                    【第五步】R2 临时文件 + send-queue 排队                             │
 │                                                                                     │
 │   R2 临时文件（processed/ 目录，已转换为目标格式）：                                   │
-│   processed/logs_20260328_xxx-0-1774683718956.txt  ← 300条日志，纯文本               │
+│   processed/logs_20260328_xxx-0-1774683718956.txt  ← 最多1000条日志，纯文本          │
 │                                                                                     │
 │   ┌─────────────────────────────────────────┐                                      │
 │   │  Queue: send-queue（发送任务队列）        │                                      │
@@ -377,7 +377,7 @@ li { margin: 5px 0; font-size: 14px; }
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                   【第六步】Sender Worker — 压缩、签名、发送                           │
 │                                                                                     │
-│   ① 从 R2 读取临时文件（已转换好的300条目标格式日志）                                  │
+│   ① 从 R2 读取临时文件（已转换好的最多1000条目标格式日志）                              │
 │          │                                                                           │
 │          ▼                                                                           │
 │   ② Gzip 压缩 Body（合作方规范要求）                                                  │
@@ -605,7 +605,7 @@ wrangler secret list</pre>
 <span class="key">dead_letter_queue</span>  = <span class="str">"send-dlq"</span>
 
 [vars]
-<span class="key">BATCH_SIZE</span> = <span class="str">"300"</span>   <span class="comment"># 每次 POST 的最大日志行数</span>
+<span class="key">BATCH_SIZE</span> = <span class="str">"1000"</span>  <span class="comment"># 每次 POST 的最大日志行数</span>
 <span class="key">LOG_LEVEL</span>  = <span class="str">"info"</span>  <span class="comment"># debug | info | warn | error</span>
 
 <span class="key">workers_dev</span>  = false
@@ -631,8 +631,8 @@ wrangler secret list</pre>
     </tr>
     <tr>
       <td>BATCH_SIZE</td><td>Var</td>
-      <td>300</td>
-      <td>每批 POST 包含的日志行数，建议不超过 500</td>
+      <td>1000</td>
+      <td>每批 POST 包含的日志行数</td>
     </tr>
     <tr>
       <td>LOG_LEVEL</td><td>Var</td>
