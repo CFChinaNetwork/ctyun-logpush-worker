@@ -429,6 +429,15 @@ li { margin: 5px 0; font-size: 14px; }
 
     <h4>MD5 Authentication</h4>
     <p>Workers' <code>SubtleCrypto</code> API does not support MD5. A pure-JS RFC 1321 implementation is included in <code>src/index.js</code>. The auth URL signature format is: <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>.</p>
+
+    <h4>Response Content-Length (Field #21)</h4>
+    <p>The <code>http_requests</code> dataset does not expose a dedicated <code>Content-Length</code> field. The Worker resolves field #21 using a three-level fallback:</p>
+    <ol style="margin:8px 0 8px 20px; font-size:14px;">
+      <li><strong>ResponseHeaders['content-length']</strong> — most accurate; requires Logpush Custom Fields to be configured via API (see Step 6b in Deployment)</li>
+      <li><strong>EdgeResponseBodyBytes</strong> — actual response body bytes; used when Custom Fields are not configured or the header is absent (e.g. HTTP/2, gzip-encoded responses)</li>
+      <li><strong>EdgeResponseBytes</strong> — total bytes including response headers; final fallback when EdgeResponseBodyBytes is zero</li>
+    </ol>
+    <div class="tip tip-info">Custom Fields configuration for <code>content-length</code> is optional. The Worker functions correctly without it using the fallback chain above.</div>
   </div>
 
   <h3>Reliability Model</h3>
@@ -546,6 +555,86 @@ wrangler secret list</pre>
         <li>Sample rate: <code>1</code> (100%)</li>
       </ol>
       <div class="tip tip-warn">Timestamp format must be set to <strong>Unix</strong>. The parser auto-detects all three formats but Unix is recommended for consistency.</div>
+    </div>
+  </div>
+
+  <div class="step-card">
+    <div class="step-card-header"><div class="snum" style="background:#888">6b</div><h3>Enable Content-Length Logging <span style="font-weight:400; font-size:13px; color:#aaa;">— Optional</span></h3></div>
+    <div class="step-card-body">
+      <p>By default, field #21 (<code>sent_http_content_length</code>) falls back to <code>EdgeResponseBodyBytes</code>. To capture the true <code>Content-Length</code> response header value, configure Logpush Custom Fields via API. This is a one-time zone-level configuration.</p>
+      <div class="tip tip-warn">This configuration requires API access. It cannot be set through the Cloudflare Dashboard UI.</div>
+
+      <h4>Step A — Check for existing Custom Fields ruleset</h4>
+      <pre><span class="comment"># List zone rulesets and find http_log_custom_fields phase</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
+  --request GET \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | select(.phase == "http_log_custom_fields") | {id, phase}'</pre>
+      <p>If a ruleset is returned, note its <code>id</code> as <code>RULESET_ID</code> and skip to Step C. If no result, proceed to Step B.</p>
+
+      <h4>Step B — Create the Custom Fields ruleset (only if Step A returned nothing)</h4>
+      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
+  --request POST \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "name": "Zone-level phase entry point",
+    "kind": "zone",
+    "description": "Custom log fields for Logpush",
+    "phase": "http_log_custom_fields"
+  }' | jq '.result.id'</pre>
+      <p>Note the returned <code>id</code> as <code>RULESET_ID</code>.</p>
+
+      <h4>Step C — Configure content-length capture</h4>
+      <p>Use <code>raw_response_fields</code> to capture the original <code>content-length</code> value from the origin before any CF transformations.</p>
+      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$RULESET_ID" \
+  --request PUT \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "rules": [
+      {
+        "action": "log_custom_field",
+        "expression": "true",
+        "description": "Capture content-length response header for Logpush",
+        "action_parameters": {
+          "raw_response_fields": [
+            { "name": "content-length" }
+          ]
+        }
+      }
+    ]
+  }'</pre>
+
+      <h4>Step D — Add ResponseHeaders to the Logpush job</h4>
+      <pre><span class="comment"># Get your Logpush job ID first</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs" \
+  --request GET \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | {id, name, dataset}'
+
+<span class="comment"># Update job to include ResponseHeaders field</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
+  --request PUT \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "output_options": {
+      "field_names": [
+        "CacheCacheStatus","ClientCountry","ClientIP","ClientRequestBytes",
+        "ClientRequestHost","ClientRequestMethod","ClientRequestProtocol",
+        "ClientRequestReferer","ClientRequestScheme","ClientRequestURI",
+        "ClientRequestUserAgent","ClientSSLProtocol","ClientSrcPort",
+        "EdgeColoCode","EdgeResponseBodyBytes","EdgeResponseBytes",
+        "EdgeResponseContentType","EdgeResponseStatus","EdgeServerIP",
+        "EdgeStartTimestamp","EdgeTimeToFirstByteMs","OriginIP",
+        "OriginRequestHeaderSendDurationMs","OriginResponseDurationMs",
+        "OriginResponseHeaderReceiveDurationMs","OriginResponseStatus",
+        "OriginTLSHandshakeDurationMs","ParentRayID","RayID",
+        "ResponseHeaders"
+      ],
+      "timestamp_format": "unix"
+    }
+  }'</pre>
+      <div class="tip tip-success">Once configured, <code>ResponseHeaders</code> in each log line will contain <code>{"content-length": "12345"}</code> and the Worker will automatically use it for field #21.</div>
+      <div class="tip tip-info">Note: For HTTP/2 responses or gzip-compressed responses, CF may omit <code>Content-Length</code> and use chunked transfer encoding instead. In those cases the Worker falls back to <code>EdgeResponseBodyBytes</code> automatically.</div>
     </div>
   </div>
 

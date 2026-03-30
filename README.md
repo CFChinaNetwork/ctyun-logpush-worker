@@ -32,6 +32,10 @@ CF Edge → Logpush → R2 (cdn-logs-raw)
 
 Push to `main` branch triggers automatic deployment via GitHub Actions.
 
+## Optional: Enable Content-Length Logging (Field #21)
+
+By default, field #21 (`sent_http_content_length`) uses `EdgeResponseBodyBytes` as fallback. To capture the true `Content-Length` response header, configure Logpush Custom Fields via the Cloudflare API (one-time zone-level setup). See the deployment guides in `docs/` for the full API configuration steps.
+
 ## Documentation
 
 | Language | File |

@@ -428,6 +428,15 @@ li { margin: 5px 0; font-size: 14px; }
 
     <h4>MD5 鉴权</h4>
     <p>Workers 的 <code>SubtleCrypto</code> API 不支持 MD5 算法，因此 <code>src/index.js</code> 内嵌了纯 JS 实现的 RFC 1321 MD5。鉴权 URL 签名格式为：<code>MD5({uri}-{ts}-{rand}-{privateKey})</code>。</p>
+
+    <h4>响应内容长度字段（#21 sent_http_content_length）</h4>
+    <p><code>http_requests</code> 数据集没有直接暴露 <code>Content-Length</code> 字段。Worker 对字段 #21 采用三级回退策略：</p>
+    <ol style="margin:8px 0 8px 20px; font-size:14px;">
+      <li><strong>ResponseHeaders['content-length']</strong> — 最准确；需通过 API 配置 Logpush Custom Fields（见部署步骤 6b）</li>
+      <li><strong>EdgeResponseBodyBytes</strong> — 实际响应体字节数；未配置 Custom Fields 或响应头不含该字段时（如 HTTP/2、gzip 压缩响应）使用</li>
+      <li><strong>EdgeResponseBytes</strong> — 含响应头的总字节数；EdgeResponseBodyBytes 为零时的最终兜底</li>
+    </ol>
+    <div class="tip tip-info">Content-Length 的 Custom Fields 配置是可选项。不配置时 Worker 通过上述回退链正常运行。</div>
   </div>
 
   <h3>可靠性模型</h3>
@@ -545,6 +554,86 @@ wrangler secret list</pre>
         <li>Sample rate：<code>1</code>（100% 采样）</li>
       </ol>
       <div class="tip tip-warn">Timestamp format 必须选 <strong>Unix</strong>，否则时间戳解析可能出错。</div>
+    </div>
+  </div>
+
+  <div class="step-card">
+    <div class="step-card-header"><div class="snum" style="background:#888">6b</div><h3>开启 Content-Length 日志采集 <span style="font-weight:400; font-size:13px; color:#aaa;">— 可选</span></h3></div>
+    <div class="step-card-body">
+      <p>默认情况下，字段 #21（<code>sent_http_content_length</code>）回退使用 <code>EdgeResponseBodyBytes</code>。如需采集真实的 <code>Content-Length</code> 响应头值，需通过 API 配置 Logpush Custom Fields。这是一次性的 Zone 级别配置。</p>
+      <div class="tip tip-warn">此配置只能通过 API 完成，Cloudflare Dashboard UI 不支持设置 raw response fields。</div>
+
+      <h4>步骤 A — 查找是否已有 Custom Fields Ruleset</h4>
+      <pre><span class="comment"># 列出所有 ruleset，找 http_log_custom_fields 阶段</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
+  --request GET \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | select(.phase == "http_log_custom_fields") | {id, phase}'</pre>
+      <p>若有返回，记录 <code>id</code> 作为 <code>RULESET_ID</code>，跳至步骤 C。若无返回，执行步骤 B。</p>
+
+      <h4>步骤 B — 创建 Custom Fields Ruleset（仅步骤 A 无结果时执行）</h4>
+      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
+  --request POST \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "name": "Zone-level phase entry point",
+    "kind": "zone",
+    "description": "Custom log fields for Logpush",
+    "phase": "http_log_custom_fields"
+  }' | jq '.result.id'</pre>
+      <p>记录返回的 <code>id</code> 作为 <code>RULESET_ID</code>。</p>
+
+      <h4>步骤 C — 配置采集 content-length 响应头</h4>
+      <p>使用 <code>raw_response_fields</code> 捕获源站返回的原始 <code>content-length</code> 值（CF Transform Rules 修改之前）。</p>
+      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$RULESET_ID" \
+  --request PUT \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "rules": [
+      {
+        "action": "log_custom_field",
+        "expression": "true",
+        "description": "Capture content-length response header for Logpush",
+        "action_parameters": {
+          "raw_response_fields": [
+            { "name": "content-length" }
+          ]
+        }
+      }
+    ]
+  }'</pre>
+
+      <h4>步骤 D — 在 Logpush Job 中加入 ResponseHeaders 字段</h4>
+      <pre><span class="comment"># 先获取 Logpush Job ID</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs" \
+  --request GET \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | {id, name, dataset}'
+
+<span class="comment"># 更新 Job，加入 ResponseHeaders 字段</span>
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
+  --request PUT \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "output_options": {
+      "field_names": [
+        "CacheCacheStatus","ClientCountry","ClientIP","ClientRequestBytes",
+        "ClientRequestHost","ClientRequestMethod","ClientRequestProtocol",
+        "ClientRequestReferer","ClientRequestScheme","ClientRequestURI",
+        "ClientRequestUserAgent","ClientSSLProtocol","ClientSrcPort",
+        "EdgeColoCode","EdgeResponseBodyBytes","EdgeResponseBytes",
+        "EdgeResponseContentType","EdgeResponseStatus","EdgeServerIP",
+        "EdgeStartTimestamp","EdgeTimeToFirstByteMs","OriginIP",
+        "OriginRequestHeaderSendDurationMs","OriginResponseDurationMs",
+        "OriginResponseHeaderReceiveDurationMs","OriginResponseStatus",
+        "OriginTLSHandshakeDurationMs","ParentRayID","RayID",
+        "ResponseHeaders"
+      ],
+      "timestamp_format": "unix"
+    }
+  }'</pre>
+      <div class="tip tip-success">配置完成后，每条日志的 <code>ResponseHeaders</code> 字段将包含 <code>{"content-length": "12345"}</code>，Worker 自动将其用于字段 #21。</div>
+      <div class="tip tip-info">注意：HTTP/2 响应或 CF 开启 gzip 压缩时，源站可能不发送 <code>Content-Length</code> 头（改用 chunked transfer encoding），此时 Worker 自动回退至 <code>EdgeResponseBodyBytes</code>。</div>
     </div>
   </div>
 
