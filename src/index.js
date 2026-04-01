@@ -88,7 +88,7 @@ const MONTH_ABBR = Object.freeze([
   'Jan','Feb','Mar','Apr','May','Jun',
   'Jul','Aug','Sep','Oct','Nov','Dec',
 ]);
-const VERSION_EDGE = 'cs_vod_v3.0';
+const VERSION_EDGE = 'cf_vod_v3.0';
 // 字段占位组（严格保证145字段总数）
 // 1-45(45) + 46-54(9) + 55(1) + 56-59(4) + 60(1) + 61(1) + 62(1)
 // + 63-64(2) + 65-80(16) + 81-95(15) + 96-145(50) = 145
