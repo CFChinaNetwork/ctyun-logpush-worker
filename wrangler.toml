@@ -45,22 +45,30 @@ dead_letter_queue  = "send-dlq"
 # PARSE_QUEUE_NAME / SEND_QUEUE_NAME 必须与上方 queue = "..." 的名字完全一致
 # index.js 通过这两个变量识别消息来自哪个 queue，无需修改 index.js
 #
-# PUSH_START_TIME：精准时间点推送控制
+# PUSH_START_TIME：统一时间点推送控制（一个变量，两种模式）
 #   - 空字符串（默认）：不过滤，正常处理所有日志
-#   - 设置后：仅推送该时间点之后产生的日志，之前的日志静默跳过
+#   - 未来时间：到达该时间点后自动开始推送，之前的日志静默跳过
+#   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
 #   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）
 #          或 "2026-04-15T18:00:00+08:00"（北京时间）
-#   - 一次性逻辑：时间点过后所有新文件均满足条件，过滤自动失效，无需修改代码
+#   - 一次性逻辑：时间点过后所有新文件自然通过过滤，无需修改代码
+#   - 补救幂等：同一个时间值只执行一次恢复（通过 R2 标记文件防重复）
 [vars]
 PARSE_QUEUE_NAME = "parse-queue"
 SEND_QUEUE_NAME  = "send-queue"
 BATCH_SIZE       = "1000"
 LOG_LEVEL        = "info"
-PUSH_START_TIME  = "2026-04-17T11:30:00+08:00"
+PUSH_START_TIME  = ""
 
 
 workers_dev  = false
 preview_urls = false
+
+# ─── Cron 触发器 ─────────────────────────────────────────────────────────────
+# 每分钟触发一次 scheduled handler，用于检查是否需要触发历史日志补传
+# 补传仅在 PUSH_START_TIME 为过去时间且未执行过时触发，其他情况秒级返回
+[triggers]
+crons = ["* * * * *"]
 
 [observability]
 [observability.logs]
