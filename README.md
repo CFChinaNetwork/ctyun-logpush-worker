@@ -2,6 +2,26 @@
 
 Cloudflare Worker — transforms and forwards Logpush logs to a CDN partner log ingestion endpoint.
 
+## ⚠️ Pre-Deployment Checklist — Customer Must Configure
+
+Before deploying, **edit `wrangler.toml`** and replace the placeholders with your own values:
+
+| Line | Placeholder | Replace With |
+|---|---|---|
+| `name` | `your-logpush-worker-name` | Your chosen Worker name (any unique name) |
+| `account_id` | `YOUR_CLOUDFLARE_ACCOUNT_ID` | Your Cloudflare Account ID (Dashboard → right corner, or `wrangler whoami`) |
+| `bucket_name` | `cdn-logs-raw` | Your actual R2 bucket name |
+| `R2_BUCKET_NAME` (in `[vars]`) | `cdn-logs-raw` | Must match `bucket_name` above |
+| Queue names (`queue = "..."`) | `parse-queue`, `send-queue` | Your Queue names (create them in CF Dashboard first) |
+| Queue name vars (`PARSE_QUEUE_NAME`, `SEND_QUEUE_NAME`) | `parse-queue`, `send-queue` | Must match queue names above |
+
+Then set three Worker secrets via `wrangler secret put`:
+```bash
+wrangler secret put CTYUN_ENDPOINT        # Log ingestion server URL
+wrangler secret put CTYUN_PRIVATE_KEY     # Authentication private key
+wrangler secret put CTYUN_URI_EDGE        # Target URI path
+```
+
 ## Architecture
 
 ```
@@ -30,6 +50,7 @@ CF Edge → Logpush → R2 (cdn-logs-raw)
 | `PUSH_START_TIME` | Var | Unified time control (ISO 8601). Empty = disabled. **Future time** → natural wait. **Past time** → auto-recovery: Cron scans R2 and re-enqueues historical files from that time onwards (idempotent). |
 | `PARSE_QUEUE_NAME` | Var | Queue name for parse-queue (must match `wrangler.toml`) |
 | `SEND_QUEUE_NAME` | Var | Queue name for send-queue (must match `wrangler.toml`) |
+| `R2_BUCKET_NAME` | Var | R2 bucket name (must match `wrangler.toml` bucket_name) |
 
 ## Deployment
 

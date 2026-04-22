@@ -11,7 +11,8 @@
  *                   (idempotent via R2 marker file .recover-done-<timestamp>)
  *
  * Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
- * Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME, PUSH_START_TIME
+ * Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
+ *               R2_BUCKET_NAME, PUSH_START_TIME
  */
 'use strict';
 // ─── IATA机场三字码 → 国家两字码（CDN节点所在国家，用于#45 country字段）─────────
@@ -539,8 +540,10 @@ async function recoverLogs(env, startMs, endMs) {
         // 文件时间 [fileStartMs, fileEndMs] 与目标 [startMs, endMs] 有重叠
         if (fileStartMs <= endMs && fileEndMs >= startMs) {
           matched++;
+          // bucket 字段仅为与 R2 Event Notification 原生消息格式保持一致
+          // Parser 实际通过 env.RAW_BUCKET binding 访问，不读 bucket 字段
           toEnqueue.push({
-            body: { bucket: 'cdn-logs-raw', object: { key } },
+            body: { bucket: env.R2_BUCKET_NAME || 'cdn-logs-raw', object: { key } },
           });
         }
       }

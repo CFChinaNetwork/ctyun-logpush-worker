@@ -621,6 +621,18 @@ Lines 2001–2500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre
   <div class="section-title"><div class="num">6</div>Deployment Guide</div>
 
   <div class="tip tip-warn">Prerequisites: Node.js v18+ installed locally. Wrangler CLI installed (<code>npm install -g wrangler</code>). A Cloudflare API Token scoped to the target account with the following permissions: <strong>Workers Scripts:Edit</strong>, <strong>Workers R2 Storage:Edit</strong>, and <strong>Workers Queue:Edit</strong> (use the Edit Cloudflare Workers template and manually add the R2 and Queue permissions).</div>
+
+  <div class="tip tip-error"><strong>Pre-deployment required edits in <code>wrangler.toml</code>:</strong>
+    <ul style="margin:6px 0 0 20px; font-size:13.5px;">
+      <li><code>name</code> → your Worker name (any unique name)</li>
+      <li><code>account_id</code> → your CF Account ID (Dashboard → right corner, or <code>wrangler whoami</code>)</li>
+      <li><code>bucket_name</code> → your R2 bucket name (created in Step 1)</li>
+      <li><code>R2_BUCKET_NAME</code> in <code>[vars]</code> → must match <code>bucket_name</code> above</li>
+      <li>Queue names (<code>queue = "..."</code> in producers &amp; consumers) → your Queue names (created in Step 2)</li>
+      <li><code>PARSE_QUEUE_NAME</code> / <code>SEND_QUEUE_NAME</code> in <code>[vars]</code> → must match queue names above</li>
+    </ul>
+    The provided template contains placeholders like <code>your-logpush-worker-name</code> and <code>YOUR_CLOUDFLARE_ACCOUNT_ID</code> which <strong>will fail deployment if not replaced</strong>.
+  </div>
   <div class="tip tip-warn">Before deploying, obtain from your log ingestion partner: server endpoint URL, authentication private key, and the target URI path.</div>
 
   <div class="step-card">
@@ -867,6 +879,11 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
       <td>CTYUN_URI_EDGE</td><td>Secret</td>
       <td>/logpost/yourpath</td>
       <td>Target URI path for HTTP POST (provided by log partner)</td>
+    </tr>
+    <tr>
+      <td>R2_BUCKET_NAME</td><td>Var</td>
+      <td>cdn-logs-raw</td>
+      <td>R2 bucket name. <strong>Must match</strong> <code>[[r2_buckets]] bucket_name</code> above.</td>
     </tr>
     <tr>
       <td>BATCH_SIZE</td><td>Var</td>

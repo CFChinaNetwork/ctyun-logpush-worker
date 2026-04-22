@@ -617,6 +617,18 @@ t = ~90s     日志成功送达合作方接收端 ✓
   <div class="section-title"><div class="num">6</div>部署指南</div>
 
   <div class="tip tip-warn">前置条件：本地已安装 Node.js v18+；已安装 Wrangler CLI（<code>npm install -g wrangler</code>）；已准备好 Cloudflare API Token，权限范围限定为目标账号，需包含以下三项：<strong>Workers Scripts:Edit</strong>、<strong>Workers R2 Storage:Edit</strong>、<strong>Workers Queue:Edit</strong>（可使用 Edit Cloudflare Workers 模板后手动追加后两项）。</div>
+
+  <div class="tip tip-error"><strong>部署前必须修改 <code>wrangler.toml</code> 的以下占位符：</strong>
+    <ul style="margin:6px 0 0 20px; font-size:13.5px;">
+      <li><code>name</code> → Worker 名字（自定义，任意唯一名称）</li>
+      <li><code>account_id</code> → 你的 CF Account ID（Dashboard 右上角，或 <code>wrangler whoami</code> 获取）</li>
+      <li><code>bucket_name</code> → 你的 R2 bucket 名字（在步骤1创建）</li>
+      <li><code>[vars]</code> 里的 <code>R2_BUCKET_NAME</code> → 必须与上方 <code>bucket_name</code> 完全一致</li>
+      <li>Queue 名字（producers / consumers 中的 <code>queue = "..."</code>）→ 你的实际 Queue 名字（在步骤2创建）</li>
+      <li><code>[vars]</code> 里的 <code>PARSE_QUEUE_NAME</code> / <code>SEND_QUEUE_NAME</code> → 必须与 queue 名字一致</li>
+    </ul>
+    模板中包含 <code>your-logpush-worker-name</code>、<code>YOUR_CLOUDFLARE_ACCOUNT_ID</code> 等占位符，<strong>未替换将无法部署</strong>。
+  </div>
   <div class="tip tip-warn">部署前请向日志对接方确认：推送服务器地址（Endpoint）、鉴权私钥（Private Key）、接收 URI 路径（URI Path）。</div>
 
   <div class="step-card">
@@ -863,6 +875,11 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
       <td>CTYUN_URI_EDGE</td><td>Secret</td>
       <td>/logpost/yourpath</td>
       <td>HTTP POST 目标 URI 路径，由对接方提供</td>
+    </tr>
+    <tr>
+      <td>R2_BUCKET_NAME</td><td>Var</td>
+      <td>cdn-logs-raw</td>
+      <td>R2 bucket 名字。<strong>必须与</strong>上方 <code>[[r2_buckets]] bucket_name</code> 完全一致。</td>
     </tr>
     <tr>
       <td>BATCH_SIZE</td><td>Var</td>

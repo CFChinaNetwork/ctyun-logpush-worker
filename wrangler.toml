@@ -1,13 +1,16 @@
-name = "ctyun-logpush"
+# ─── 基础配置（部署前必须修改）──────────────────────────────────────────────
+# name: Worker 名字，自定义，会显示在 CF Dashboard
+# account_id: 你的 Cloudflare Account ID，从 Dashboard 右上角或 `wrangler whoami` 获取
+name = "your-logpush-worker-name"
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
 main = "src/index.js"
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
-account_id = "0297df3199a94c8082d099ac2212c40a"
 
-# ─── R2 存储桶 ────────────────────────────────────────────────────────────────
-# 如需修改 R2 bucket 名字：
-#   1. 修改下面的 bucket_name 为新名字
-#   （binding = "RAW_BUCKET" 不要改，index.js 通过此 binding 访问）
+# ─── R2 存储桶（部署前必须确认/修改）─────────────────────────────────────────
+# bucket_name: 你在 CF R2 中创建的实际 bucket 名字
+# 同步修改下方 [vars] 里的 R2_BUCKET_NAME 保持一致
+# （binding = "RAW_BUCKET" 不要改，index.js 通过此 binding 访问 R2）
 [[r2_buckets]]
 binding     = "RAW_BUCKET"
 bucket_name = "cdn-logs-raw"
@@ -56,6 +59,7 @@ dead_letter_queue  = "send-dlq"
 [vars]
 PARSE_QUEUE_NAME = "parse-queue"
 SEND_QUEUE_NAME  = "send-queue"
+R2_BUCKET_NAME   = "cdn-logs-raw"   # 必须与上方 [[r2_buckets]] bucket_name 完全一致
 BATCH_SIZE       = "1000"
 LOG_LEVEL        = "info"
 PUSH_START_TIME  = ""
