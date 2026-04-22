@@ -39,7 +39,7 @@ dead_letter_queue  = "parse-dlq"
 
 [[queues.consumers]]
 queue              = "send-queue"    # 必须与上方 producers send-queue 名字一致
-max_batch_size     = 30              # 降低并发避免 Memory 超限（50 并发 × ~2MB/文件 接近 128MB 上限）
+max_batch_size     = 20              # 实测 50 导致 Memory 超限/Worker 挂掉 → 积压暴增到 25K+，回退到保守的 20
 max_batch_timeout  = 5
 max_retries        = 5
 dead_letter_queue  = "send-dlq"
