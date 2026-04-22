@@ -518,8 +518,8 @@ Lines 2001–2500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre
     <h4>Stage 4 — Sender Worker &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Event-driven, batched by max_batch_size / max_batch_timeout</span></h4>
     <p>The Worker is woken up when either condition is met:</p>
     <ul style="font-size:14px; margin:6px 0 10px 20px;">
-      <li><strong>max_batch_size = 50</strong>: 50 messages accumulated → Worker fires immediately</li>
-      <li><strong>max_batch_timeout = 5s</strong>: fewer than 50 messages but 5 seconds elapsed → Worker fires anyway</li>
+      <li><strong>max_batch_size = 30</strong>: 30 messages accumulated → Worker fires immediately</li>
+      <li><strong>max_batch_timeout = 5s</strong>: fewer than 30 messages but 5 seconds elapsed → Worker fires anyway</li>
     </ul>
     <p>Each message triggers one independent HTTP POST. Messages within a batch are processed concurrently (Promise.allSettled). Failed sends are retried by the Queue (up to 5×) before moving to send-dlq.</p>
   </div>
@@ -531,8 +531,8 @@ Lines 2001–2500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre
     <tr><td>R2 → Queue notification</td><td>R2 Event Notification</td><td>2–5s (CF internal)</td><td>Fixed overhead; not configurable</td></tr>
     <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>5</td><td>Max files processed per Worker invocation; reduce if CPU exceeded events increase</td></tr>
     <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>10s</td><td>Max wait before firing Worker with fewer than max_batch_size messages</td></tr>
-    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>Max concurrent HTTP POSTs per Worker invocation</td></tr>
-    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>Max wait before firing Sender with fewer than 50 messages</td></tr>
+    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>30</td><td>Max concurrent HTTP POSTs per Worker invocation</td></tr>
+    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>Max wait before firing Sender with fewer than 30 messages</td></tr>
     <tr><td>BATCH_SIZE</td><td>wrangler.toml [vars]</td><td>1000</td><td>Max log lines per HTTP POST payload; controls R2 temp file size and POST frequency</td></tr>
     <tr><td>PUSH_START_TIME</td><td>wrangler.toml [vars]</td><td><em>empty</em></td><td>Unified time control. Empty = disabled. Future time = natural wait. Past time = Cron auto-triggers R2 scan and historical backfill.</td></tr>
     <tr><td>parse-queue max_retries</td><td>wrangler.toml</td><td>2</td><td>Parse failures retry 2× before moving to parse-dlq</td></tr>

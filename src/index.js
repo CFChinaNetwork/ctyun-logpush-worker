@@ -185,9 +185,17 @@ async function processFile(msg, env) {
   }
 }
 async function writeBatchAndEnqueue(lines, sourceKey, index, env) {
-  const body     = lines.join('\n') + '\n';
   const safeKey  = sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const batchKey = `${BATCH_PREFIX}${safeKey}-${index}-${Date.now()}.txt`;
+  // 确定性 batchKey（不带时间戳）：Parser 重试时同一个 (sourceKey, index) 始终对应同一个文件
+  const batchKey = `${BATCH_PREFIX}${safeKey}-${index}.txt`;
+  // 幂等检查：如果该 batch 已被 Sender 成功发送过（存在 .done 标记），直接跳过
+  // 这避免了 Parser 中途失败重试时，已发送的 batch 被重复发送，导致数据翻倍
+  const doneMarker = await env.RAW_BUCKET.head(`${batchKey}.done`).catch(() => null);
+  if (doneMarker) {
+    log(env, 'debug', `Batch already sent (skip): ${batchKey}`);
+    return;
+  }
+  const body = lines.join('\n') + '\n';
   await env.RAW_BUCKET.put(batchKey, body, {
     httpMetadata: { contentType: 'text/plain; charset=utf-8' },
   });
@@ -214,8 +222,15 @@ async function handleSendQueue(batch, env) {
 async function sendBatch(msg, env) {
   const { key } = msg.body;
   if (!key) throw new Error(`Invalid message: ${JSON.stringify(msg.body)}`);
+  // 幂等检查：如果已存在 .done 标记，说明该 batch 曾成功发送过（Queue 重复投递场景）
+  // 直接静默 ack，避免重复发送导致数据翻倍
+  const doneMarker = await env.RAW_BUCKET.head(`${key}.done`).catch(() => null);
+  if (doneMarker) {
+    log(env, 'info', `Already sent (skip duplicate): ${key}`);
+    return;
+  }
   const object = await env.RAW_BUCKET.get(key);
-  if (!object) { log(env, 'warn', `Batch not found (may be sent): ${key}`); return; }
+  if (!object) { log(env, 'warn', `Batch not found (may be sent or rolled back): ${key}`); return; }
   const body       = await object.text();
   const compressed = await gzipCompress(body);
   const uri        = env.CTYUN_URI_EDGE;
@@ -233,12 +248,17 @@ async function sendBatch(msg, env) {
     throw new Error(`HTTP ${resp.status} ${resp.statusText} | ${text.substring(0, 200)}`);
   }
   // 必须消费 response body，否则并发场景下 CF 会触发 "stalled HTTP response" 保护
-  // 强行取消最老的响应（导致偶发失败+重试）。对 200 响应我们不关心内容，直接丢弃。
   await resp.body?.cancel().catch(() => {});
   const lineCount = body.split('\n').filter(l => l.trim()).length;
   log(env, 'info', `Sent ${lineCount} lines → HTTP ${resp.status} | ${key}`);
-  // delete 失败不能触发 msg.retry()，否则已成功发送的日志会被重发，导致数据翻倍
-  // 临时文件残留由 R2 lifecycle rule 兜底清理（已在 R2 控制台配置 processed/ 24h 自动删除）
+  // 先写入幂等标记，确保即使后续 delete 失败，重复消息也能被识别
+  // 标记文件必须先于 batch 文件删除，否则可能出现"标记没写成功但文件已删"的窗口期
+  await env.RAW_BUCKET.put(`${key}.done`, '1', {
+    httpMetadata: { contentType: 'text/plain' },
+  }).catch((e) => {
+    log(env, 'warn', `Done marker write failed (may cause duplicate on retry): ${key}: ${e.message}`);
+  });
+  // delete 失败不能触发重发（会导致翻倍），只记警告，R2 lifecycle 会兜底清理
   await env.RAW_BUCKET.delete(key).catch((e) => {
     log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${e.message}`);
   });

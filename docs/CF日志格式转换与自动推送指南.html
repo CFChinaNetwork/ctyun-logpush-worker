@@ -517,8 +517,8 @@ t = ~90s     日志成功送达合作方接收端 ✓
     <h4>第四阶段 — Sender Worker &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">事件驱动，按 max_batch_size / max_batch_timeout 批量聚合</span></h4>
     <p>满足以下任一条件时 Worker 被唤醒：</p>
     <ul style="font-size:14px; margin:6px 0 10px 20px;">
-      <li><strong>max_batch_size = 50</strong>：积累到 50 条消息 → 立即触发</li>
-      <li><strong>max_batch_timeout = 5s</strong>：不足 50 条但已等待 5 秒 → 同样触发</li>
+      <li><strong>max_batch_size = 30</strong>：积累到 30 条消息 → 立即触发</li>
+      <li><strong>max_batch_timeout = 5s</strong>：不足 30 条但已等待 5 秒 → 同样触发</li>
     </ul>
     <p>每条消息对应一次独立的 HTTP POST，同一批次内的消息并发处理（Promise.allSettled）。发送失败由 Queue 重试（最多 5 次），彻底失败后转入 send-dlq。</p>
   </div>
@@ -530,8 +530,8 @@ t = ~90s     日志成功送达合作方接收端 ✓
     <tr><td>R2 → Queue 通知延迟</td><td>R2 Event Notification</td><td>2–5s（CF 内部）</td><td>固定开销，不可配置</td></tr>
     <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>5</td><td>每次 Worker 调用最多处理的文件数；CPU 超限频繁时可降低</td></tr>
     <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>10s</td><td>消息不足 max_batch_size 时的最长等待时间</td></tr>
-    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>每次 Worker 调用最多并发发送的批次数</td></tr>
-    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>消息不足 50 条时的最长等待时间</td></tr>
+    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>30</td><td>每次 Worker 调用最多并发发送的批次数</td></tr>
+    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>消息不足 30 条时的最长等待时间</td></tr>
     <tr><td>BATCH_SIZE</td><td>wrangler.toml [vars]</td><td>1000</td><td>每次 POST 最多包含的日志行数；控制单个 R2 临时文件大小和 POST 频率</td></tr>
     <tr><td>PUSH_START_TIME</td><td>wrangler.toml [vars]</td><td><em>空</em></td><td>统一时间点控制。空 = 禁用。未来时间 = 自然等待。过去时间 = Cron 自动触发 R2 扫描并补传历史日志。</td></tr>
     <tr><td>parse-queue max_retries</td><td>wrangler.toml</td><td>2</td><td>解析失败重试 2 次后转入 parse-dlq</td></tr>
