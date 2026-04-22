@@ -237,7 +237,11 @@ async function sendBatch(msg, env) {
   await resp.body?.cancel().catch(() => {});
   const lineCount = body.split('\n').filter(l => l.trim()).length;
   log(env, 'info', `Sent ${lineCount} lines → HTTP ${resp.status} | ${key}`);
-  await env.RAW_BUCKET.delete(key);
+  // delete 失败不能触发 msg.retry()，否则已成功发送的日志会被重发，导致数据翻倍
+  // 临时文件残留由 R2 lifecycle rule 兜底清理（已在 R2 控制台配置 processed/ 24h 自动删除）
+  await env.RAW_BUCKET.delete(key).catch((e) => {
+    log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${e.message}`);
+  });
   log(env, 'debug', `Deleted: ${key}`);
 }
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
