@@ -80,51 +80,15 @@ To activate, change `main = "src/index.js"` to `main = "src/index_optimized.js"`
 
 **Prerequisite:** the customer's log ingestion server must support HTTP/1.1 chunked transfer encoding (Transfer-Encoding: chunked). Most modern servers do, but confirm before enabling in production. If the server returns HTTP 400/411/415 after activation, rollback immediately.
 
-## Optional: Historical Backfill (`src/index_backfill.js` + `wrangler_backfill.toml`)
+## Related: Historical Backfill
 
-For recovering logs in a specific historical time range `[A, B]` that were missed by the main pipeline (e.g. after an upstream outage). Runs as a separate worker (`ctyun-logpush-backfill`) alongside production without any changes to the main worker.
+For recovering logs in a specific historical time range `[A, B]` (e.g. after an upstream outage missed a few hours of logs), a dedicated standalone worker is maintained in a separate repository:
 
-### What it does
+**[`CFChinaNetwork/ctyun-logpush-backfill`](https://github.com/CFChinaNetwork/ctyun-logpush-backfill)**
 
-1. **Phase 1 (Cleanup)** — scans `processed/` in R2, deletes batch files and `.done` markers whose embedded Logpush timestamp falls within `[A, B]`. This is critical: the `.done` marker is Sender's idempotency guard; leaving it in place would cause the re-enqueued files to be silently skipped.
-2. **Phase 2 (Enqueue)** — scans `logs/YYYYMMDD/` prefixes in R2, filters raw Logpush files intersecting `[A, B]`, rate-limits their enqueue to the shared `parse-queue`. The production worker's Parser and Sender then process them as if they were fresh.
+It runs fully independently — own queues (`parse-queue-backfill` / `send-queue-backfill`), own R2 prefix (`processed-backfill/`), rate-limited at ~5,000 lines/s. Safe to deploy alongside this production worker with zero interference.
 
-### Usage
-
-```bash
-# 1. Edit wrangler_backfill.toml:
-#    BACKFILL_START_TIME = "2026-04-22T14:00:00Z"
-#    BACKFILL_END_TIME   = "2026-04-22T19:00:00Z"
-#    BACKFILL_RATE       = "10"         # files/min; raise for faster, lower for safer
-
-# 2. Deploy the backfill worker
-wrangler deploy --config wrangler_backfill.toml
-
-# 3. Monitor progress
-curl https://ctyun-logpush-backfill.<your-subdomain>.workers.dev/backfill/status
-
-# 4. When status=done, remove the backfill worker
-wrangler delete --config wrangler_backfill.toml
-```
-
-### Behavior & Guarantees
-
-| Aspect | Behavior |
-|---|---|
-| Idempotency | State saved in R2 (`backfill-state/progress.json`); Cron safely resumable from any point |
-| Re-run | Change `BACKFILL_START_TIME`/`BACKFILL_END_TIME` and redeploy, OR delete the state file in R2 |
-| Pause | Set `BACKFILL_ENABLED="false"` and redeploy |
-| Rate limit | Default 10 files/min (~17 msg/s added load, ~13% of production capacity); max 100 |
-| Time matching | Loose intersection: any Logpush file overlapping `[A, B]` is replayed. May cause 0–5 min of duplicate data at boundaries (Logpush file granularity) |
-| Max range | 48 hours (edit `MAX_RANGE_HOURS` in `index_backfill.js` if needed) |
-| Completion signal | `status=done` in `/backfill/status` means all files **enqueued**; actual delivery to customer is asynchronous via the production Sender. Monitor `send-queue` backlog for real completion. |
-
-### Safety Notes
-
-- Backfill worker does **not** talk to the customer endpoint directly; it only enqueues to `parse-queue`. All sending goes through the production Sender, preserving authentication, retry, and `.done` idempotency.
-- Cleanup only affects `processed/` prefix in the time range; raw files in `logs/` are **never** deleted.
-- Production worker's real-time traffic is unaffected (different time range, no key collision).
-- If cron crashes mid-run, state cursor is already persisted; next cron resumes.
+> Note: the backfill workflow is distinct from this worker's built-in `PUSH_START_TIME` recovery (which triggers an automatic one-time re-scan from a past time). Use `PUSH_START_TIME` for simple "start from 15:00 onward" cases; use the separate backfill repo for precise `[A, B]` range replay with independent rate control.
 
 ## Documentation
 
