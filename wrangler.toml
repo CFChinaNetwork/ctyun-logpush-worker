@@ -3,7 +3,7 @@
 # account_id: 你的 Cloudflare Account ID，从 Dashboard 右上角或 `wrangler whoami` 获取
 name = "ctyun-logpush"
 account_id = "0297df3199a94c8082d099ac2212c40a"
-main = "src/index.js"           # 标准入口；此版本的 index.js 已内置 chunked + 并行
+main = "src/index.js"           # 唯一入口：流式发送 (chunked) + 小并行池 + fetch 30s timeout
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
@@ -78,7 +78,14 @@ SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=
 [triggers]
 crons = ["* * * * *"]
 
+# ─── Observability（Workers Logs）─────────────────────────────────────────────
+# enabled = true：顶层总开关；不设或为 false 时新版统一 Logs 不会持久化数据，
+#                  控制台 Logs 面板将显示为空，事故时无法回看 invocation 上下文。
+# head_sampling_rate = 1：100% 采样（不抽样），生产事故诊断需要完整数据。
+#                         数据保留遵循 CF 默认策略（当前约 3 天）。
 [observability]
+enabled = true
+head_sampling_rate = 1
 [observability.logs]
 enabled         = true
 invocation_logs = true

@@ -1,42 +1,43 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- *  ⚡ OPTIMIZED VERSION — Streaming Body for High Throughput
+ *  ctyun-logpush-worker
  * ─────────────────────────────────────────────────────────────────────────────
  *
- *  与 index.js 的区别（仅 1 处）：
- *    sendBatch 函数里 fetch body 从 "完整压缩后一次发送"
- *    改为 "流式压缩 + 流式发送"（HTTP Transfer-Encoding: chunked）
+ *  作用：
+ *    将 Cloudflare Logpush 的 http_requests 原始日志（NDJSON gzip，落 R2）转换为
+ *    CDN partner v3.0 的 145 字段格式，gzip 压缩后 POST 推送到客户接收端。
  *
- *  可能收益（需按客户接收端实测验证）：
- *    - 压缩和 HTTP 发送可流水线化，减少 arrayBuffer 等待
- *    - 内存占用进一步降低（只保留 stream 小缓冲，无需缓存整个压缩副本）
+ *  Pipeline：
+ *    Logpush → R2 logs/ → R2 Event Notification → parse-queue
+ *      → Parser Worker → R2 processed/*.txt
+ *      → send-queue → Sender Worker → gzip + auth_key POST → customer endpoint
  *
- *  前提条件（启用前必须确认）：
- *    ⚠️  接收端服务器必须支持 HTTP Transfer-Encoding: chunked
- *        (大部分现代服务器如 nginx/ATS/IIS/Caddy 默认都支持)
- *    如果接收端只接受 Content-Length 固定长度的请求体，会返回 400/411 错误
+ *  发送实现（流式管道）：
+ *    object.body → CompressionStream('gzip') → fetch body
+ *    压缩与 HTTP 发送可流水线化，无需把整个压缩副本缓存到内存。
  *
- *  如何启用（客户侧）：
- *    1. 在 wrangler.toml 里修改 main = "src/index_optimized.js"
- *    2. git commit + push → CI/CD 自动部署
- *    3. 观察 send-queue backlog 和 Worker error logs
- *    4. 若出现大量 400/411 错误 → 立即回退 main = "src/index.js"
+ *  接收端前提：
+ *    ⚠️  必须支持 HTTP/1.1 Transfer-Encoding: chunked（无 Content-Length）。
+ *        nginx / ATS / IIS / Caddy 等现代服务器默认都支持。
+ *        若接收端只接受 Content-Length 固定长度请求体，会返回 400/411/415。
  *
- *  回退方式：
- *    修改 wrangler.toml 的 main 指向回 "src/index.js"，git push 即可
- *    （两个文件并存，回退零成本）
+ *  超时防御：
+ *    fetch() 设置 AbortSignal.timeout(30_000)。客户端 hang 时单次 fetch 最多 30s
+ *    会被中断 → 抛 AbortError → 外层 catch 触发 msg.retry()。
+ *    防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
  *
- *  其他逻辑与 index.js 完全一致：
+ *  关键机制：
  *    - PUSH_START_TIME 时间过滤（未来/过去双模式）
- *    - Scheduled handler 自动补传机制
+ *    - Scheduled handler 自动补传（一次性 + 幂等 marker）
  *    - send-queue 同 batch 内串行 + .done 标记保证 at-least-once 幂等
- *    - Queue send 失败回滚
- *    - resp.body.cancel() 防 stalled
- *    - delete 失败不抛异常
+ *    - Queue send 失败回滚 R2 临时文件
+ *    - resp.body.cancel() 防 stalled HTTP response
+ *    - delete 失败不抛异常（R2 lifecycle 兜底）
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
- *                R2_BUCKET_NAME, PUSH_START_TIME, FIELD11_SERVER_IP
+ *                R2_BUCKET_NAME, PUSH_START_TIME, FIELD11_SERVER_IP,
+ *                SEND_PARALLELISM
  */
 'use strict';
 // ─── IATA机场三字码 → 国家两字码（CDN节点所在国家，用于#45 country字段）─────────
@@ -335,21 +336,14 @@ async function sendBatchUnlocked(key, env) {
   const privateKey = env.CTYUN_PRIVATE_KEY;
   if (!endpoint || !privateKey || !uri) throw new Error('Missing CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY or CTYUN_URI_EDGE');
 
-  // ⚡ OPTIMIZED: 完全流式管道（R2 stream → gzip → fetch body，无中间缓冲）
-  // vs index.js: 去掉了 `await new Response(...).arrayBuffer()` 的阻塞等待
+  // 流式管道：R2 stream → CompressionStream(gzip) → fetch body
+  //   - 压缩与 HTTP 发送可流水线化，无 ArrayBuffer 中间缓冲
+  //   - 内存占用约 ~10 KB/请求（只有 stream 小缓冲）
   //
-  // 优势：
-  //   - 压缩和 HTTP 发送并行进行，省 ~100-300ms 等待
-  //   - 内存占用从 ~100KB/请求 降到 ~10KB（只有 stream 小缓冲）
-  //   - 内存占用低于 ArrayBuffer 版本
-  //
-  // 代价：
-  //   - fetch 使用 Transfer-Encoding: chunked（无 Content-Length）
-  //   - 要求接收端支持 HTTP/1.1 chunked（大部分现代服务器默认支持）
-  //
-  // 兼容性退路：
-  //   如果接收端返回 400/411/415 等错误，说明不支持 chunked
-  //   → 回退到 index.js（wrangler.toml 改 main 路径即可）
+  // 接收端要求：
+  //   HTTP/1.1 Transfer-Encoding: chunked（请求体无 Content-Length）。
+  //   现代服务器（nginx / ATS / IIS / Caddy）默认支持；若收到 400/411/415，
+  //   说明接收端不支持 chunked 请求体，需协调客户端启用。
   const compressedStream = object.body.pipeThrough(new CompressionStream('gzip'));
 
   const fetchInit = {
@@ -359,6 +353,9 @@ async function sendBatchUnlocked(key, env) {
       'Content-Encoding': 'gzip',
     },
     body: compressedStream,
+    // 单次 fetch 最多等 30s；客户端 hang 时 abort 后由外层 catch → msg.retry() 接管。
+    // 防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
+    signal: AbortSignal.timeout(30_000),
   };
   const resp = await fetch(buildAuthUrl(endpoint, uri, privateKey), fetchInit);
   if (!resp.ok) {

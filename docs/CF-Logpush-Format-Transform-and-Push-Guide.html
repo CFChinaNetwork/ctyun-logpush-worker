@@ -443,6 +443,7 @@ li { margin: 5px 0; font-size: 14px; }
   <table>
     <tr><th>Failure Scenario</th><th>Behavior</th><th>Recovery</th></tr>
     <tr><td>Remote endpoint temporarily unavailable</td><td>send-queue retries up to 5× with exponential backoff (~15 min window)</td><td>Automatic; R2 file preserved until delivery confirmed</td></tr>
+    <tr><td>Remote endpoint hangs on a single request</td><td>Per-fetch <code>AbortSignal.timeout(30_000)</code>: a single POST is aborted after 30s and falls back to queue retry</td><td>Automatic; prevents a single invocation from exhausting the Queue consumer's 15-min wall-time limit</td></tr>
     <tr><td>Malformed log record in source file</td><td>Per-line error caught; line skipped; batch continues</td><td>Error count logged; file-level processing succeeds</td></tr>
     <tr><td>Parser crash on corrupt .gz file</td><td>parse-queue retries 2×; moves to parse-dlq</td><td>Manual inspection of DLQ message + raw R2 file</td></tr>
     <tr><td>Duplicate Queue delivery</td><td>Sequential within an invocation; existing <code>.done</code> marker or missing R2 temp file → silent ack</td><td>At-least-once delivery; a narrow race window across concurrent invocations remains, converged by the <code>.done</code> marker</td></tr>
@@ -533,7 +534,7 @@ Lines 2001–2500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre
     <tr><th>Parameter</th><th>Location</th><th>Current Value</th><th>Effect</th></tr>
     <tr><td>Logpush interval</td><td>Logpush Job config</td><td>~60s (CF internal)</td><td>The only clock in the pipeline; determines minimum end-to-end latency</td></tr>
     <tr><td>R2 → Queue notification</td><td>R2 Event Notification</td><td>2–5s (CF internal)</td><td>Fixed overhead; not configurable</td></tr>
-    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>3</td><td>Max files processed per Worker invocation; reduce if CPU exceeded events increase</td></tr>
+    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>3</td><td>Max files processed per Worker invocation</td></tr>
     <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>10s</td><td>Max wait before firing Worker with fewer than max_batch_size messages</td></tr>
     <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>Max messages delivered per Sender invocation</td></tr>
     <tr><td>send-queue max_concurrency</td><td>wrangler.toml</td><td><em>unset</em> (autoscale, platform cap 250)</td><td>Queue autoscaler scales invocations based on backlog</td></tr>
@@ -948,7 +949,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
     <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>System consuming in real time</td><td>Healthy — no action needed</td></tr>
     <tr><td>Backlog growing continuously</td><td>Consumption falling behind production — genuine bottleneck</td><td>Check Worker errors; scale if needed</td></tr>
-    <tr><td>Exceeded CPU Time Limits &gt; 0</td><td>Individual Logpush file too large for single Worker invocation</td><td>Monitor frequency; do NOT reduce <code>max_batch_size</code></td></tr>
+    <tr><td>Exceeded CPU Time Limits &gt; 0 (a.k.a. <code>exceededResources</code>)</td><td>Usually <strong>wall-time</strong> exceeded (15-min Queue-consumer limit), not CPU. Most common cause: receiver-side <code>fetch</code> stall. The Dashboard label "CPU" is a UI generalization of <code>exceededResources</code>; check actual <code>cpuTimeP999</code> via GraphQL — typically far below the configured <code>cpu_ms</code></td><td>Per-fetch 30s <code>AbortSignal.timeout</code> already mitigates this; if recurring, check receiver endpoint latency / availability. Do NOT reduce <code>max_batch_size</code> as a first reflex</td></tr>
     <tr><td>Messages Retried &gt; 0</td><td>Partner endpoint instability</td><td>Investigate 5xx subrequests; confirm endpoint capacity</td></tr>
     <tr><td>DLQ &gt; 0</td><td>Data loss risk — highest priority</td><td>Inspect DLQ messages immediately; manually reprocess from R2</td></tr>
     <tr><td>send-queue backlog growing</td><td>Receiver is slow or unavailable, or <code>max_concurrency</code> was manually capped low</td><td>Check endpoint latency/errors; verify <code>max_concurrency</code> is unset (autoscale recommended)</td></tr>

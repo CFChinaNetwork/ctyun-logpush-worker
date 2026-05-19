@@ -442,6 +442,7 @@ li { margin: 5px 0; font-size: 14px; }
   <table>
     <tr><th>故障场景</th><th>系统行为</th><th>恢复方式</th></tr>
     <tr><td>接收端临时不可用</td><td>send-queue 指数退避重试，最多 5 次（约 15 分钟窗口）</td><td>自动恢复；R2 临时文件保留至确认成功</td></tr>
+    <tr><td>接收端单次请求 hang</td><td>每个 fetch 设置 <code>AbortSignal.timeout(30_000)</code>：单个 POST 超过 30 秒自动中断并交由 queue 重试</td><td>自动恢复；避免单个 invocation 占满 Queue consumer 的 15 分钟 wall time 上限</td></tr>
     <tr><td>原始文件含格式错误行</td><td>逐行捕获异常，跳过该行，继续处理</td><td>错误计数写入日志；文件级处理成功</td></tr>
     <tr><td>parse-queue 处理失败</td><td>重试 2 次后转入 parse-dlq</td><td>人工检查 DLQ 消息及 R2 原始文件</td></tr>
     <tr><td>Queue 重复投递</td><td>同 batch 内串行；若 <code>.done</code> 已存在或 R2 临时文件已删除，则静默 ack</td><td>at-least-once 投递；并发 invocation 间残留极窄重复窗口，由 <code>.done</code> 标记收敛</td></tr>
@@ -532,7 +533,7 @@ t = ~90s     日志成功送达合作方接收端 ✓
     <tr><th>参数</th><th>位置</th><th>当前值</th><th>作用说明</th></tr>
     <tr><td>Logpush 推送间隔</td><td>Logpush Job 配置</td><td>~60s（CF 内部）</td><td>流水线唯一时钟；决定端到端延迟的最小基准值</td></tr>
     <tr><td>R2 → Queue 通知延迟</td><td>R2 Event Notification</td><td>2–5s（CF 内部）</td><td>固定开销，不可配置</td></tr>
-    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>3</td><td>每次 Worker 调用最多处理的文件数；CPU 超限频繁时可降低</td></tr>
+    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>3</td><td>每次 Worker 调用最多处理的文件数</td></tr>
     <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>10s</td><td>消息不足 max_batch_size 时的最长等待时间</td></tr>
     <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>每次 Sender 调用最多接收的消息数</td></tr>
     <tr><td>send-queue max_concurrency</td><td>wrangler.toml</td><td><em>未设置</em>（autoscale，当前上限 250）</td><td>由 autoscaler 根据 backlog 自动扩缩 invocation 数量</td></tr>
@@ -944,7 +945,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><th>信号</th><th>含义</th><th>处理方式</th></tr>
     <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>系统实时消化，运行健康</td><td>正常，无需操作</td></tr>
     <tr><td>Backlog 持续增长</td><td>消费速度跟不上生产速度，真正的瓶颈信号</td><td>检查 Worker 错误日志；必要时扩容</td></tr>
-    <tr><td>CPU Time Exceeded &gt; 0</td><td>单个 Logpush 文件过大，单次调用 CPU 超限</td><td>持续监控频率；<strong>不要</strong>降低 <code>max_batch_size</code></td></tr>
+    <tr><td>CPU Time Exceeded &gt; 0（实际是 <code>exceededResources</code>）</td><td>大多数情况下是 <strong>wall time</strong> 超限（Queue consumer 15 分钟硬限），而非 CPU 超限。常见根因：接收端 <code>fetch</code> 长时间无响应。Dashboard 把 <code>exceededResources</code> 笼统显示为 "CPU"，可用 GraphQL 查 <code>cpuTimeP999</code> 验证（通常远低于配置的 <code>cpu_ms</code>）</td><td>每个 fetch 已加 30 秒 <code>AbortSignal.timeout</code> 做防御；若反复出现，需排查接收端时延与可用性。不要先反射性地降低 <code>max_batch_size</code></td></tr>
     <tr><td>Messages Retried &gt; 0</td><td>接收端不稳定</td><td>排查 5xx 子请求；确认接收端容量</td></tr>
     <tr><td>DLQ &gt; 0</td><td>有数据丢失风险，最高优先级</td><td>立即检查 DLQ 消息；从 R2 手动补传</td></tr>
     <tr><td>send-queue 积压持续增长</td><td>接收端变慢或不可用，或 send-queue <code>max_concurrency</code> 被人为压低</td><td>检查接收端延迟和错误率；确认 <code>max_concurrency</code> 未被压低（推荐留空 autoscale）</td></tr>

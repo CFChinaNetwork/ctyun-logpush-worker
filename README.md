@@ -36,7 +36,9 @@ Per-variable semantics (BATCH_SIZE, RAW_LOG_PREFIX/SUFFIX, etc.) are documented 
 ## Reliability Notes
 
 - Queue delivery is at-least-once. `.done` markers in R2 narrow the duplicate-POST window from Queue redelivery.
-- `send-queue` consumer leaves `max_concurrency` unset to allow autoscaling; messages are processed sequentially within each invocation.
+- `send-queue` consumer leaves `max_concurrency` unset to allow autoscaling; messages within each invocation are processed by a small parallel pool (`SEND_PARALLELISM`, default 2).
+- Sender uses streaming gzip + chunked request body. **Customer endpoint must accept HTTP/1.1 `Transfer-Encoding: chunked`** (no `Content-Length`). If you see HTTP `400`/`411`/`415`, the endpoint does not support chunked bodies and the customer side needs to enable it.
+- Each `fetch` to the customer endpoint is bounded by `AbortSignal.timeout(30_000)`. A hang on the receiver side is aborted after 30s and falls back to queue retry, preventing a single invocation from exhausting the Queue consumer's 15-minute wall-time limit.
 - The parser ignores non-raw R2 objects (defaults: only `logs/...*.log.gz`).
 
 ## PUSH_START_TIME
@@ -51,9 +53,17 @@ Per-variable semantics (BATCH_SIZE, RAW_LOG_PREFIX/SUFFIX, etc.) are documented 
 
 Past-time recovery is one-shot per exact `PUSH_START_TIME` value and capped at 62 days. For wider ranges or precise `[A, B]` backfill use [`CFChinaNetwork/ctyun-logpush-backfill`](https://github.com/CFChinaNetwork/ctyun-logpush-backfill).
 
-## Optimized Sender
+## Observability
 
-Default entrypoint: `src/index.js`. An optional `src/index_optimized.js` streams `R2 -> gzip -> fetch body` (chunked transfer encoding) to reduce memory. Only switch to it after confirming the customer endpoint accepts chunked request bodies; if you see HTTP `400`/`411`/`415`, revert `main` in `wrangler.toml` to `src/index.js`.
+`wrangler.toml` enables Workers Logs persistence with 100% sampling:
+
+```toml
+[observability]
+enabled = true
+head_sampling_rate = 1
+```
+
+Logs are required for diagnosing `exceededResources` (CPU / memory / wall-time / subrequest) outcomes. Without the top-level `enabled = true`, the Logs panel and `telemetry/query` API will return empty data.
 
 ## Deploy
 
