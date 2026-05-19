@@ -53,18 +53,6 @@ Per-variable semantics (BATCH_SIZE, RAW_LOG_PREFIX/SUFFIX, etc.) are documented 
 
 Past-time recovery is one-shot per exact `PUSH_START_TIME` value and capped at 62 days. For wider ranges or precise `[A, B]` backfill use [`CFChinaNetwork/ctyun-logpush-backfill`](https://github.com/CFChinaNetwork/ctyun-logpush-backfill).
 
-## Observability
-
-`wrangler.toml` enables Workers Logs persistence with 100% sampling:
-
-```toml
-[observability]
-enabled = true
-head_sampling_rate = 1
-```
-
-Logs are required for diagnosing `exceededResources` (CPU / memory / wall-time / subrequest) outcomes. Without the top-level `enabled = true`, the Logs panel and `telemetry/query` API will return empty data.
-
 ## Deploy
 
 Push to `main` triggers GitHub Actions deployment. To validate locally:
