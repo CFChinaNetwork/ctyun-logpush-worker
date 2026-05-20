@@ -22,7 +22,7 @@
  *        若接收端只接受 Content-Length 固定长度请求体，会返回 400/411/415。
  *
  *  超时防御：
- *    fetch() 设置 AbortSignal.timeout(30_000)。客户端 hang 时单次 fetch 最多 30s
+ *    fetch() 设置 AbortSignal.timeout(60_000)。客户端 hang 时单次 fetch 最多 60s
  *    会被中断 → 抛 AbortError → 外层 catch 触发 msg.retry()。
  *    防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
  *
@@ -353,9 +353,9 @@ async function sendBatchUnlocked(key, env) {
       'Content-Encoding': 'gzip',
     },
     body: compressedStream,
-    // 单次 fetch 最多等 30s；客户端 hang 时 abort 后由外层 catch → msg.retry() 接管。
+    // 单次 fetch 最多等 60s；客户端 hang 时 abort 后由外层 catch → msg.retry() 接管。
     // 防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(60_000),
   };
   const resp = await fetch(buildAuthUrl(endpoint, uri, privateKey), fetchInit);
   if (!resp.ok) {

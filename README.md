@@ -38,7 +38,7 @@ Per-variable semantics (BATCH_SIZE, RAW_LOG_PREFIX/SUFFIX, etc.) are documented 
 - Queue delivery is at-least-once. `.done` markers in R2 narrow the duplicate-POST window from Queue redelivery.
 - `send-queue` consumer leaves `max_concurrency` unset to allow autoscaling; messages within each invocation are processed by a small parallel pool (`SEND_PARALLELISM`, default 2).
 - Sender uses streaming gzip + chunked request body. **Customer endpoint must accept HTTP/1.1 `Transfer-Encoding: chunked`** (no `Content-Length`). If you see HTTP `400`/`411`/`415`, the endpoint does not support chunked bodies and the customer side needs to enable it.
-- Each `fetch` to the customer endpoint is bounded by `AbortSignal.timeout(30_000)`. A hang on the receiver side is aborted after 30s and falls back to queue retry, preventing a single invocation from exhausting the Queue consumer's 15-minute wall-time limit.
+- Each `fetch` to the customer endpoint is bounded by `AbortSignal.timeout(60_000)`. A hang on the receiver side is aborted after 60s and falls back to queue retry, preventing a single invocation from exhausting the Queue consumer's 15-minute wall-time limit.
 - The parser ignores non-raw R2 objects (defaults: only `logs/...*.log.gz`).
 
 ## PUSH_START_TIME
