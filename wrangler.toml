@@ -31,46 +31,88 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
+# parse-queue：max_batch_size=1（单 invocation 只解析 1 个文件，配合 index.js 串行处理，
+#   把峰值内存从「batch 内全部文件叠加」降到「单个文件」，杜绝 128MB OOM）。
+#   max_concurrency=10：普适设置——内存安全的前提下给足并发（10 个并发单文件解析 ≈ 数百文件/分钟，
+#   足以覆盖天量域名的实时转发）。注意：过去「不设上限」叠加 batch_size=3，正是 OOM 的结构性诱因
+#   （isolate 累积内存超 128MB → 整个 isolate 被杀 → 同 isolate 内 parse/send 一起重投）。
+#   bounded-but-stable 的吞吐 > unbounded-but-crashing。
+#   max_retries=5：从 2 提高，给「并发型瞬时 OOM」更多恢复机会（index.js 的 retry 还带 delaySeconds 退避）。
 [[queues.consumers]]
 queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
-max_batch_size     = 3
-max_batch_timeout  = 10
-max_retries        = 2
-dead_letter_queue  = "parse-dlq"
-
-[[queues.consumers]]
-queue              = "send-queue"    # 必须与上方 producers send-queue 名字一致
-max_batch_size     = 50              # 单次最多取 50 条；同一 batch 内 for-await 串行，避免单 invocation 内并发 POST
+max_batch_size     = 1
 max_batch_timeout  = 5
 max_retries        = 5
+max_concurrency    = 10
+dead_letter_queue  = "parse-dlq"
+
+# send-queue：max_concurrency=20（普适上限）。发送是流式 gzip，单次内存小，但「接收端慢」时
+#   发送 invocation 会滞留（fetch 超时已收紧到 30s），不设上限会让大量慢发送在同一 isolate 堆积内存。
+#   20 个并发即使在最慢时段也有充足吞吐（实测峰值需求 ~30 批/分钟，20 并发远超）。
+#   .done 标记保证重复投递不会重复 POST。
+[[queues.consumers]]
+queue              = "send-queue"    # 必须与上方 producers send-queue 名字一致
+max_batch_size     = 50              # 单次最多取 50 条；同一 batch 内小并行池(SEND_PARALLELISM)
+max_batch_timeout  = 5
+max_retries        = 5
+max_concurrency    = 20
 dead_letter_queue  = "send-dlq"
-# max_concurrency 故意不设置：由 Queue autoscaler 自动扩缩（当前上限 250），保证吞吐。
-# Queue 重复投递的并发重复 POST 风险由 sendBatchUnlocked 中的 .done 标记缩窄。
+
+# ─── DLQ 自动重驱动消费者（核心修复：消除「进 DLQ 就永久滞留」）──────────────────
+# 让本 worker 同时消费 parse-dlq / send-dlq；index.js 的 handleDlqRedrive 会把死信消息
+#   以「指数退避 + 抖动」的延迟回灌到各自源队列，全自动恢复，无需人工、无需告警。
+#   重驱动安全（不重复）：依赖确定性 batchKey + .done 标记，重解析时已发批次自动跳过。
+# 注意：DLQ consumer 本身【不设 dead_letter_queue】——避免衍生出 parse-dlq-dlq 无限套娃；
+#   重驱动 handler 极轻（仅 send+ack），失败则原地重试（max_retries 给高一些）。
+# max_concurrency=1：死信量小且重驱动开销低，温和排空即可，不与主管线抢并发。
+[[queues.consumers]]
+queue              = "parse-dlq"     # 必须与 parse-queue 的 dead_letter_queue 一致；[vars].PARSE_DLQ_NAME 同步
+max_batch_size     = 10
+max_batch_timeout  = 30
+max_retries        = 10
+max_concurrency    = 1
+
+[[queues.consumers]]
+queue              = "send-dlq"      # 必须与 send-queue 的 dead_letter_queue 一致；[vars].SEND_DLQ_NAME 同步
+max_batch_size     = 10
+max_batch_timeout  = 30
+max_retries        = 10
+max_concurrency    = 1
 
 # ─── 环境变量 ─────────────────────────────────────────────────────────────────
-# PARSE_QUEUE_NAME / SEND_QUEUE_NAME 必须与上方 queue = "..." 的名字完全一致
-# index.js 通过这两个变量识别消息来自哪个 queue，无需修改 index.js
+# PARSE_QUEUE_NAME / SEND_QUEUE_NAME / PARSE_DLQ_NAME / SEND_DLQ_NAME 必须与上方对应
+#   queue = "..." 的名字完全一致；index.js 通过这四个变量识别消息来自哪个 queue（含两个 DLQ）。
+#   ⚠️ 多域名部署：每个域名把这 4 个名字 + 上方 4 个 consumer 的 queue + producer 的 queue
+#      统一替换为带域名后缀的名字（如 parse-queue-<domain> / parse-dlq-<domain>），保持一一对应。
 #
 # PUSH_START_TIME：统一时间点推送控制（一个变量，两种模式）
 #   - 空字符串（默认）：不过滤，正常处理所有日志
 #   - 未来时间：到达该时间点后自动开始推送，之前的日志静默跳过
 #   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
-#   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）
-#          或 "2026-04-15T18:00:00+08:00"（北京时间）
-#   - 一次性逻辑：时间点过后所有新文件自然通过过滤，无需修改代码
-#   - 补救幂等：同一个时间值只执行一次恢复（通过 R2 标记文件防重复）
+#   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）或 "2026-04-15T18:00:00+08:00"（北京时间）
 # FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
+# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 30000=30s，范围 1000~60000）。接收端慢时尽快 abort
+#   重试，减少慢发送在 isolate 内堆积内存（OOM 触发链）。
+# RETRY_DELAY_SECONDS：parser/sender 失败重试的延迟秒数（默认 30）。只延迟失败的少数，不拖慢成功路径。
+# REDRIVE_BASE/MAX/JITTER_DELAY_SECONDS：DLQ 重驱动回灌延迟的「指数退避基数/封顶/抖动」（默认 60/3600/30）。
 [vars]
 PARSE_QUEUE_NAME = "parse-queue"
 SEND_QUEUE_NAME  = "send-queue"
+PARSE_DLQ_NAME   = "parse-dlq"       # 必须与 parse-queue 的 dead_letter_queue 及 DLQ consumer 一致
+SEND_DLQ_NAME    = "send-dlq"        # 必须与 send-queue 的 dead_letter_queue 及 DLQ consumer 一致
 R2_BUCKET_NAME   = "cdn-logs-raw"   # 必须与上方 [[r2_buckets]] bucket_name 完全一致
-BATCH_SIZE       = "2000"            # 每批 2000 行，降低消息数以提升整体吞吐
+BATCH_SIZE       = "2000"            # 每批 2000 行。⚠️ 改此值前须先清空 DLQ：否则破坏 .done 幂等(index→行区间错位)
 RAW_LOG_PREFIX   = "logs/"          # 仅处理匹配此前缀的 R2 原始日志对象
 RAW_LOG_SUFFIX   = ".log.gz"        # 仅处理匹配此后缀的 R2 原始日志对象
 LOG_LEVEL        = "info"
 PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
+SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)，默认 30s
+RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
+REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)
+REDRIVE_MAX_DELAY_SECONDS  = "3600"  # DLQ 重驱动退避封顶(s)
+REDRIVE_JITTER_SECONDS     = "30"    # DLQ 重驱动抖动(s)，防 thundering herd
 
 # ─── Cron 触发器 ─────────────────────────────────────────────────────────────
 # 每分钟触发一次 scheduled handler，用于检查是否需要触发历史日志补传

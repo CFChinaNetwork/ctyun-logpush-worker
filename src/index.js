@@ -33,11 +33,16 @@
  *    - Queue send 失败回滚 R2 临时文件
  *    - resp.body.cancel() 防 stalled HTTP response
  *    - delete 失败不抛异常（R2 lifecycle 兜底）
+ *    - DLQ 自动重驱动：worker 同时消费 parse-dlq / send-dlq，把死信消息以
+ *      指数退避+抖动的延迟回灌到各自源队列，全自动恢复，无需人工/告警。
+ *      依赖确定性 batchKey + .done 标记保证重驱动不产生重复（适配无去重接收端）。
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
- *                R2_BUCKET_NAME, PUSH_START_TIME, FIELD11_SERVER_IP,
- *                SEND_PARALLELISM
+ *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME, PUSH_START_TIME,
+ *                FIELD11_SERVER_IP, SEND_PARALLELISM, SEND_FETCH_TIMEOUT_MS,
+ *                RETRY_DELAY_SECONDS, REDRIVE_BASE_DELAY_SECONDS,
+ *                REDRIVE_MAX_DELAY_SECONDS, REDRIVE_JITTER_SECONDS
  */
 'use strict';
 // ─── IATA机场三字码 → 国家两字码（CDN节点所在国家，用于#45 country字段）─────────
@@ -175,7 +180,10 @@ export default {
   async queue(batch, env, ctx) {
     if      (batch.queue === env.PARSE_QUEUE_NAME) await handleParseQueue(batch, env);
     else if (batch.queue === env.SEND_QUEUE_NAME)  await handleSendQueue(batch, env);
-    else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME`);
+    // DLQ 自动重驱动：死信回灌到各自源队列（无人工、无告警）。绑定 binding 沿用现有 producer。
+    else if (env.PARSE_DLQ_NAME && batch.queue === env.PARSE_DLQ_NAME) await handleDlqRedrive(batch, env, env.PARSE_QUEUE, env.PARSE_QUEUE_NAME, 'parse');
+    else if (env.SEND_DLQ_NAME  && batch.queue === env.SEND_DLQ_NAME)  await handleDlqRedrive(batch, env, env.SEND_QUEUE,  env.SEND_QUEUE_NAME,  'send');
+    else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME/PARSE_DLQ_NAME/SEND_DLQ_NAME`);
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handleScheduled(env));
@@ -184,7 +192,63 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  await Promise.allSettled(batch.messages.map(msg => processFile(msg, env)));
+  // 串行处理本批文件：避免单 invocation 内并行解析多个大文件导致内存叠加触发 OOM
+  // （128MB/isolate）。与 wrangler max_batch_size=1 配合形成双保险——即使将来调大
+  // batch_size，单次 invocation 的峰值内存仍只取决于「一个文件」而非「batch 内全部文件」。
+  // 吞吐量由 consumer 的 max_concurrency（多个并发 invocation）保证，不依赖单 invocation 内并行，
+  // 因此对大流量域名的实时转发无负面影响。processFile 内部自行 ack/retry，循环不会因单文件失败中断。
+  for (const msg of batch.messages) {
+    await processFile(msg, env);
+  }
+}
+
+// ─── DLQ 自动重驱动消费者 ────────────────────────────────────────────────────
+// 设计目标（全自动、无人工、无告警）：
+//   进入 parse-dlq / send-dlq 的死信消息不再永久滞留，而是以「指数退避 + 抖动」的延迟
+//   回灌到各自源队列（parse-queue / send-queue），交给正常的幂等管线重新处理。
+// 为什么安全（不产生重复，适配无去重接收端）：
+//   - Parser 的 batchKey 是确定性的（processed/<safeKey>-<index>.txt），Sender 成功后写 .done 标记。
+//   - 重驱动 → 重解析 → 已发送批次撞 .done 跳过 → 只补发从未发出的尾部 → 零重复。
+//   - 前提：BATCH_SIZE 不变（否则 index→行区间 错位会破坏 .done 匹配）。修改 BATCH_SIZE 须先清空 DLQ。
+// 行为：
+//   - 瞬时型失败（并发 OOM、端点抖动）：延迟后再试通常即成功，自愈。
+//   - 真正的「毒消息」：__redrive 计数驱动退避逐次拉长（封顶 REDRIVE_MAX_DELAY_SECONDS），
+//     退化为低频无害循环，不烧资源、不需人工介入。
+//   - 抖动避免一次性大量死信同时回灌造成 thundering herd。
+// 普适：随模板部署到所有域名后，自动清空各自的 DLQ，无需逐域名打补丁。
+async function handleDlqRedrive(batch, env, targetQueue, targetName, label) {
+  // 绑定缺失时（误配置）：不丢消息，整批重试，等待修复
+  if (!targetQueue) {
+    log(env, 'error', `[REDRIVE:${label}] target queue binding missing; retrying batch`);
+    for (const m of batch.messages) m.retry({ delaySeconds: retryDelaySeconds(env) });
+    return;
+  }
+  const base = parseIntegerVar(env, 'REDRIVE_BASE_DELAY_SECONDS', 60, 0, 86400);
+  const max  = parseIntegerVar(env, 'REDRIVE_MAX_DELAY_SECONDS', 3600, 0, 86400);
+  const jit  = parseIntegerVar(env, 'REDRIVE_JITTER_SECONDS', 30, 0, 3600);
+  for (const msg of batch.messages) {
+    try {
+      // 保留原始消息体（Parser 读 body.object.key；Sender 读 body.key），仅附加 __redrive 计数
+      const orig = (msg.body && typeof msg.body === 'object') ? msg.body : { __rawBody: msg.body };
+      const attempt = (Number(orig.__redrive) || 0) + 1;
+      // 指数退避（封顶）+ 抖动；delaySeconds 上限 86400（24h）
+      const backoff = Math.min(base * Math.pow(2, attempt - 1), max);
+      const delaySeconds = Math.min(backoff + Math.floor(Math.random() * (jit + 1)), 86400);
+      await targetQueue.send({ ...orig, __redrive: attempt }, { delaySeconds });
+      msg.ack();
+      log(env, 'info', `[REDRIVE:${label}] re-enqueued → ${targetName} (attempt #${attempt}, delay ${delaySeconds}s)`);
+    } catch (e) {
+      // 回灌失败（源队列暂时不可用等）：重试该死信消息，绝不丢弃
+      log(env, 'warn', `[REDRIVE:${label}] re-enqueue failed, will retry: ${e.message || e}`);
+      msg.retry({ delaySeconds: retryDelaySeconds(env) });
+    }
+  }
+}
+
+// 失败重试延迟（秒）：仅延迟「失败的少数」的重试，不影响成功路径的实时性。
+// 用于 parser/sender 的 msg.retry({delaySeconds})，给瞬时型故障（并发压力、端点抖动）恢复时间。
+function retryDelaySeconds(env) {
+  return parseIntegerVar(env, 'RETRY_DELAY_SECONDS', 30, 0, 43200);
 }
 async function processFile(msg, env) {
   const key = msg.body?.object?.key;
@@ -253,7 +317,9 @@ async function processFile(msg, env) {
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
-    msg.retry();
+    // 延迟重试：给「并发型瞬时 OOM / R2 抖动」等留出恢复时间；耗尽 max_retries 后进 parse-dlq，
+    // 再由 handleDlqRedrive 自动延迟回灌，最终自愈（不会永久丢失）。
+    msg.retry({ delaySeconds: retryDelaySeconds(env) });
   }
 }
 async function writeBatchAndEnqueue(lines, sourceKey, index, env) {
@@ -307,7 +373,8 @@ async function handleSendQueue(batch, env) {
         msg.ack();
       } catch (err) {
         log(env, 'warn', `Send failed, retry: ${err.message || err}`);
-        msg.retry();
+        // 延迟重试：端点慢/抖动时退避；耗尽 max_retries 后进 send-dlq，再由 handleDlqRedrive 自动回灌。
+        msg.retry({ delaySeconds: retryDelaySeconds(env) });
       }
     }
   };
@@ -346,6 +413,11 @@ async function sendBatchUnlocked(key, env) {
   //   说明接收端不支持 chunked 请求体，需协调客户端启用。
   const compressedStream = object.body.pipeThrough(new CompressionStream('gzip'));
 
+  // 单次 fetch 超时（默认 30s，可配）：客户端 hang 时尽快 abort → 外层 catch → msg.retry() 接管。
+  // 作用有二：①缩短「慢发送滞留」时间，降低同一 isolate 内并发发送的内存堆积（OOM 触发链）；
+  //          ②保证最坏情况下单 invocation wall = (max_batch_size / SEND_PARALLELISM) × 超时 仍 < 15min 上限。
+  // 默认从历史的 60s 收紧到 30s（接收端慢时 durationP99 曾逼近 60s）。Enterprise 接收端正常应远快于此。
+  const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 30000, 1000, 60000);
   const fetchInit = {
     method: 'POST',
     headers: {
@@ -353,9 +425,7 @@ async function sendBatchUnlocked(key, env) {
       'Content-Encoding': 'gzip',
     },
     body: compressedStream,
-    // 单次 fetch 最多等 60s；客户端 hang 时 abort 后由外层 catch → msg.retry() 接管。
-    // 防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(sendTimeoutMs),
   };
   const resp = await fetch(buildAuthUrl(endpoint, uri, privateKey), fetchInit);
   if (!resp.ok) {
