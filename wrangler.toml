@@ -1,9 +1,21 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# 【每个域名部署前必须替换的项目（PER-DOMAIN CHECKLIST）】
+#   把 <domain> 理解为该域名的标识（如 id-upload-appstore-vivoglobal）。逐项对齐，名字必须一一对应：
+#   1) name              = "<domain>-com-log"                      （本文件 [基础配置]）
+#   2) account_id        = 该域名所在账号 ID（ss_vivo_static / ss_vivo_dynamic 等）
+#   3) r2_buckets.bucket_name 与 [vars].R2_BUCKET_NAME = "<domain>-com"   （两处必须一致）
+#   4) 队列名（producers 2 个 + consumers 4 个 + [vars] 4 个 *_QUEUE_NAME/*_DLQ_NAME）统一带后缀：
+#        parse-queue-<domain> / send-queue-<domain> / parse-dlq-<domain> / send-dlq-<domain>
+#   5) 三个 secret（不在本文件）：wrangler secret put CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE
+#   其余 [vars] 调参（BATCH_SIZE / SEND_PARALLELISM / 超时 / 重试 / 重驱动退避）一般【保持默认即可】，
+#   仅在该域名有特殊需求时按注释微调。max_concurrency【故意全部不设】（见下方 Queue 消费者实测依据）。
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─── 基础配置（部署前请根据实际情况修改）────────────────────────────────────
 # name: Worker 名字，自定义，会显示在 CF Dashboard
 # account_id: 你的 Cloudflare Account ID，从 Dashboard 右上角或 `wrangler whoami` 获取
 name = "ctyun-logpush"
 account_id = "0297df3199a94c8082d099ac2212c40a"
-main = "src/index.js"           # 唯一入口：流式发送 (chunked) + 小并行池 + fetch 30s timeout
+main = "src/index.js"           # 唯一入口：流式发送(chunked) + 小并行池 + DLQ 自动重驱动 + fetch 60s timeout
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
@@ -31,32 +43,34 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# parse-queue：max_batch_size=1（单 invocation 只解析 1 个文件，配合 index.js 串行处理，
-#   把峰值内存从「batch 内全部文件叠加」降到「单个文件」，杜绝 128MB OOM）。
-#   max_concurrency=10：普适设置——内存安全的前提下给足并发（10 个并发单文件解析 ≈ 数百文件/分钟，
-#   足以覆盖天量域名的实时转发）。注意：过去「不设上限」叠加 batch_size=3，正是 OOM 的结构性诱因
-#   （isolate 累积内存超 128MB → 整个 isolate 被杀 → 同 isolate 内 parse/send 一起重投）。
-#   bounded-but-stable 的吞吐 > unbounded-but-crashing。
-#   max_retries=5：从 2 提高，给「并发型瞬时 OOM」更多恢复机会（index.js 的 retry 还带 delaySeconds 退避）。
+# 【内存/并发设计依据：2026-06 全量实测两账号 261 个域名】
+#   - OOM 只发生在 id-upload（中等流量、单行 ~4KB 的大行域名）；流量大 60× 的 asia-vcode-od
+#     （send 实际跑 ~200 并发）以及 img/magazine/vcode-api 等全部大域名【零 OOM】。
+#   → 结论：OOM 是「单次 invocation 内存」问题（旧版 Promise.allSettled 并行解析 batch 内多文件，
+#     峰值 = batch_size × 多份拷贝），【不是并发问题】。
+#   → 正确修复 = index.js 改【串行解析】降单次内存（已改）；【不靠限并发】。
+#   → 【故意不设 max_concurrency】：实测大域名需 ~200 send 并发才能实时转发，任何低 cap 都会把它们
+#     砍到零头、造成积压延迟，违背「普适 + 大域名稳定快速实时转发」目标。串行已根除 OOM，无需再限并发。
+# parse-queue：保持 max_batch_size=3（autoscaler 行为/吞吐不变）；串行由 index.js 保证单次内存只占 1 文件。
+#   max_retries 2→5：给瞬时失败更多恢复机会（index.js retry 带 delaySeconds 退避）；耗尽后进 parse-dlq，
+#   再由 handleDlqRedrive 全自动延迟回灌，最终自愈。
 [[queues.consumers]]
 queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
-max_batch_size     = 1
-max_batch_timeout  = 5
+max_batch_size     = 3
+max_batch_timeout  = 10
 max_retries        = 5
-max_concurrency    = 10
 dead_letter_queue  = "parse-dlq"
+# max_concurrency 故意不设置（见上方实测依据）：保证大流量域名 autoscaler 充分扩并发、实时转发不被卡。
 
-# send-queue：max_concurrency=20（普适上限）。发送是流式 gzip，单次内存小，但「接收端慢」时
-#   发送 invocation 会滞留（fetch 超时已收紧到 30s），不设上限会让大量慢发送在同一 isolate 堆积内存。
-#   20 个并发即使在最慢时段也有充足吞吐（实测峰值需求 ~30 批/分钟，20 并发远超）。
-#   .done 标记保证重复投递不会重复 POST。
+# send-queue：发送是流式 gzip（单次内存小），实测大域名 ~200 并发零 OOM → 同样【不设 max_concurrency】，
+#   否则会拖垮大域名的实时推送。.done 标记保证重复投递不会重复 POST。
 [[queues.consumers]]
 queue              = "send-queue"    # 必须与上方 producers send-queue 名字一致
 max_batch_size     = 50              # 单次最多取 50 条；同一 batch 内小并行池(SEND_PARALLELISM)
 max_batch_timeout  = 5
 max_retries        = 5
-max_concurrency    = 20
 dead_letter_queue  = "send-dlq"
+# max_concurrency 故意不设置：由 autoscaler 扩缩（上限 250），保证大域名吞吐。
 
 # ─── DLQ 自动重驱动消费者（核心修复：消除「进 DLQ 就永久滞留」）──────────────────
 # 让本 worker 同时消费 parse-dlq / send-dlq；index.js 的 handleDlqRedrive 会把死信消息
@@ -91,8 +105,9 @@ max_concurrency    = 1
 #   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
 #   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）或 "2026-04-15T18:00:00+08:00"（北京时间）
 # FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
-# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 30000=30s，范围 1000~60000）。接收端慢时尽快 abort
-#   重试，减少慢发送在 isolate 内堆积内存（OOM 触发链）。
+# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 60000=60s，范围 1000~120000）。仅用于 abort 完全 hang
+#   的接收端，防止单 invocation 撑满 15min wall 上限。⚠️ 不要为「降内存」而下调——内存由串行解析控制，
+#   且 send-dlq 实测 0 写入证明 60s 从不致超时；下调反而会把慢但成功的 POST 砍成超时。极慢接收端可按域名上调。
 # RETRY_DELAY_SECONDS：parser/sender 失败重试的延迟秒数（默认 30）。只延迟失败的少数，不拖慢成功路径。
 # REDRIVE_BASE/MAX/JITTER_DELAY_SECONDS：DLQ 重驱动回灌延迟的「指数退避基数/封顶/抖动」（默认 60/3600/30）。
 [vars]
@@ -108,7 +123,7 @@ LOG_LEVEL        = "info"
 PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
-SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)，默认 30s
+SEND_FETCH_TIMEOUT_MS = "60000"      # 单次发送 fetch 超时(ms)，默认 60s（实测安全值，勿为降内存而下调）
 RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)
 REDRIVE_MAX_DELAY_SECONDS  = "3600"  # DLQ 重驱动退避封顶(s)
