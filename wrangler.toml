@@ -15,7 +15,7 @@
 # account_id: 你的 Cloudflare Account ID，从 Dashboard 右上角或 `wrangler whoami` 获取
 name = "ctyun-logpush"
 account_id = "0297df3199a94c8082d099ac2212c40a"
-main = "src/index.js"           # 唯一入口：流式发送(chunked) + 小并行池 + DLQ 自动重驱动 + fetch 60s timeout
+main = "src/index.js"           # 唯一入口：流式发送(chunked) + 小并行池 + DLQ 自动重驱动 + fetch 120s timeout
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
@@ -43,24 +43,26 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# 【内存/并发设计依据：2026-06 全量实测两账号 261 个域名】
-#   - OOM 只发生在 id-upload（中等流量、单行 ~4KB 的大行域名）；流量大 60× 的 asia-vcode-od
-#     （send 实际跑 ~200 并发）以及 img/magazine/vcode-api 等全部大域名【零 OOM】。
-#   → 结论：OOM 是「单次 invocation 内存」问题（旧版 Promise.allSettled 并行解析 batch 内多文件，
-#     峰值 = batch_size × 多份拷贝），【不是并发问题】。
-#   → 正确修复 = index.js 改【串行解析】降单次内存（已改）；【不靠限并发】。
-#   → 【故意不设 max_concurrency】：实测大域名需 ~200 send 并发才能实时转发，任何低 cap 都会把它们
-#     砍到零头、造成积压延迟，违背「普适 + 大域名稳定快速实时转发」目标。串行已根除 OOM，无需再限并发。
-# parse-queue：保持 max_batch_size=3（autoscaler 行为/吞吐不变）；串行由 index.js 保证单次内存只占 1 文件。
-#   max_retries 2→5：给瞬时失败更多恢复机会（index.js retry 带 delaySeconds 退避）；耗尽后进 parse-dlq，
-#   再由 handleDlqRedrive 全自动延迟回灌，最终自愈。
+# 【设计依据：2026-06 全量实测两账号 261 个域名，确认 gap 有两类根因，且都是「单次 invocation 资源」问题】
+#   1) 内存型 OOM(exceededMemory)：id-upload / id-update（大行 ~4KB），旧版 batch=3 并行解析时
+#      峰值内存 = batch_size × 多份拷贝，多个 invocation 撞同一 isolate → 超 128MB。
+#   2) CPU型 资源超限(exceededResources)：asia-vcode-od（单文件 10 万行、289MB），batch=3 一次转 30 万行，
+#      cpuTime P99≈31s 逼近 60s 限；6/3 一次事件丢了 2.7 万文件。img/magazine 同类。
+#   → 两类都因「单次 invocation 同时扛 batch 内多个文件」。【正确修复 = max_batch_size=1】：
+#      一次只处理 1 文件，把单次内存和 CPU 都砍到 1/3 → 同时根治两类。idempotency 不受影响(不动 BATCH_SIZE)。
+#   → 【不靠限并发，故意不设 max_concurrency】：实测大域名(asia-vcode-od)需 ~200 send 并发才能实时转发；
+#      并发限是【每队列 250】(已查文档)，batch=1 后 parse 约需 ~42 并发，远在 parse-queue 自己的 250 内、
+#      不与 send 抢额度；autoscaler 会自动横向扩，吞吐不变（CF 文档亦推荐慢消费者减小 batch 以改善扩缩）。
+#   max_retries 2→5：给瞬时失败更多恢复机会(index.js retry 带 delaySeconds 退避)；耗尽进 parse-dlq，
+#   再由 handleDlqRedrive 全自动延迟回灌自愈。
+# 注：若个别域名单文件极大、batch=1 仍逼近 60s CPU，可按域名上调 [limits].cpu_ms（Enterprise 最高 300000=5min）。
 [[queues.consumers]]
 queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
-max_batch_size     = 3
-max_batch_timeout  = 10
+max_batch_size     = 1               # 单 invocation 只解析 1 文件：同时把内存和 CPU 降到 1/3，根治 OOM + 资源超限两类
+max_batch_timeout  = 5
 max_retries        = 5
 dead_letter_queue  = "parse-dlq"
-# max_concurrency 故意不设置（见上方实测依据）：保证大流量域名 autoscaler 充分扩并发、实时转发不被卡。
+# max_concurrency 故意不设置（见上方实测依据）：保证大流量域名 autoscaler 充分扩并发（每队列上限 250），实时转发不被卡。
 
 # send-queue：发送是流式 gzip（单次内存小），实测大域名 ~200 并发零 OOM → 同样【不设 max_concurrency】，
 #   否则会拖垮大域名的实时推送。.done 标记保证重复投递不会重复 POST。
@@ -105,9 +107,8 @@ max_concurrency    = 1
 #   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
 #   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）或 "2026-04-15T18:00:00+08:00"（北京时间）
 # FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
-# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 60000=60s，范围 1000~120000）。仅用于 abort 完全 hang
-#   的接收端，防止单 invocation 撑满 15min wall 上限。⚠️ 不要为「降内存」而下调——内存由串行解析控制，
-#   且 send-dlq 实测 0 写入证明 60s 从不致超时；下调反而会把慢但成功的 POST 砍成超时。极慢接收端可按域名上调。
+# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 120000=120s，范围 1000~120000）。仅用于 abort 完全
+#   hang 的接收端（实测 invocation P999≈82s，远低于 15min wall 上限，120s 安全且给慢接收端留足余量）。
 # RETRY_DELAY_SECONDS：parser/sender 失败重试的延迟秒数（默认 30）。只延迟失败的少数，不拖慢成功路径。
 # REDRIVE_BASE/MAX/JITTER_DELAY_SECONDS：DLQ 重驱动回灌延迟的「指数退避基数/封顶/抖动」（默认 60/3600/30）。
 [vars]
@@ -123,7 +124,7 @@ LOG_LEVEL        = "info"
 PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
-SEND_FETCH_TIMEOUT_MS = "60000"      # 单次发送 fetch 超时(ms)，默认 60s（实测安全值，勿为降内存而下调）
+SEND_FETCH_TIMEOUT_MS = "120000"     # 单次发送 fetch 超时(ms)，默认 120s（P999≈82s，wall 余量足）
 RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)
 REDRIVE_MAX_DELAY_SECONDS  = "3600"  # DLQ 重驱动退避封顶(s)

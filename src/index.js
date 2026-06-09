@@ -192,17 +192,16 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  // 串行处理本批文件（关键内存修复，根因定位见下）：
-  // 旧版用 Promise.allSettled 并行解析 batch 内全部文件，单次 invocation 峰值内存
-  //   = max_batch_size × (2000 行数组 + join 串 + R2 put body 等多份拷贝)；叠加同一 isolate 内
-  //   其它并发 invocation 后突破 128MB → exceededMemory，整个 isolate 被杀 → 同 isolate 的
-  //   parse/send 消息一起重投，parse 耗尽重试进 parse-dlq。
-  // 实测佐证（2026-06）：OOM 只发生在 id-upload（单行 ~4KB 的大行域名），而流量大 60× 的
-  //   asia-vcode-od（单行 ~2.9KB、send 实际跑 ~200 并发）零 OOM → 证明 OOM 是「单次 invocation
-  //   内存」问题，**不是并发问题**。因此正确修复是串行降单次内存，而非限并发（限并发会拖垮大域名）。
-  // 改串行后：峰值内存只取决于「同一时刻一个文件」，与 max_batch_size 无关 → 根除 OOM；
-  //   且 invocation 数量不变（仍 1 invocation 处理整批），autoscaler 行为与吞吐完全不变，
-  //   大流量域名照常横向扩并发、实时转发不受影响。processFile 内部自 ack/retry，循环不因单文件失败中断。
+  // 单次 invocation 资源控制（关键修复，2026-06 全量实测定位）：
+  // gap 有两类根因，都源于「单次 invocation 同时扛 batch 内多个文件」：
+  //   1) 内存型 OOM：大行域名(id-upload/update, ~4KB/行)，旧版 batch=3 并行 → 峰值内存 = batch × 多份拷贝
+  //      (2000 行数组 + join 串 + R2 put body)，多 invocation 撞同 isolate → 超 128MB → exceededMemory。
+  //   2) CPU型 资源超限：超大文件域名(asia-vcode-od, 单文件 10 万行)，batch=3 一次转 30 万行 →
+  //      cpuTime P99≈31s 逼近 60s 限 → exceededResources。两类都【不是并发问题】(大域名 ~200 并发零 OOM)。
+  // 主修复 = wrangler max_batch_size=1：一次只处理 1 文件，把单次内存和 CPU 都降到 1/3 → 同治两类。
+  // 本处串行循环是【双保险】：即使将来有人调大 batch_size，单次峰值内存/CPU 仍只取决于「同一时刻一个文件」。
+  // 吞吐不受影响：invocation 数量由 autoscaler 横向扩（每队列上限 250，远够），大域名实时转发照常。
+  // processFile 内部自 ack/retry，循环不因单文件失败中断。
   for (const msg of batch.messages) {
     await processFile(msg, env);
   }
@@ -419,13 +418,9 @@ async function sendBatchUnlocked(key, env) {
   //   说明接收端不支持 chunked 请求体，需协调客户端启用。
   const compressedStream = object.body.pipeThrough(new CompressionStream('gzip'));
 
-  // 单次 fetch 超时（默认 60s，可配）：客户端 hang 时 abort → 外层 catch → msg.retry() 接管，
-  // 防止单 invocation 撑满 Queue consumer 15 分钟 wall 上限。
-  // ⚠️ 注意：之前误测的 durationP99≈55s 是「整批 invocation 时长（最多 50 条）」，不是单个 POST 时长；
-  //   且 send-dlq 7 天写入=0，证明 60s 从未导致发送超时失败 → 不能贸然下调（会把慢但成功的 POST 砍成超时→
-  //   重试→更多负载）。内存由「发送流式 + 不再 3 文件并行解析」控制，与本超时无关，故保持 60s。
-  //   若个别域名接收端极慢，可按域名上调 SEND_FETCH_TIMEOUT_MS（注意 ≤ 15min wall 余量）。
-  const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 60000, 1000, 120000);
+  // 单次发送 fetch 超时（默认 120s，可配 1000–120000ms）：仅用于 abort 完全 hang 的接收端 → 外层 catch
+  // → msg.retry()。实测 invocation P999≈82s，远低于 15min wall 上限，120s 安全且给慢接收端留足余量。
+  const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 120000, 1000, 120000);
   const fetchInit = {
     method: 'POST',
     headers: {
