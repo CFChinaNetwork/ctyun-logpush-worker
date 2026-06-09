@@ -24,8 +24,9 @@ files back into `parse-queue`.
 ## Per-domain configuration
 
 This template is deployed once **per domain**. For each domain, edit `wrangler.toml`
-(every field is documented inline) and set the secrets. Treat `<domain>` as the
-hostname identifier, e.g. `id-upload-appstore-vivoglobal`.
+(every field is documented inline) and set the secrets. `<domain>` below is the
+per-deployment hostname slug used consistently across the worker name, bucket, and
+queue names.
 
 | In `wrangler.toml` | Set to |
 |---|---|
@@ -45,9 +46,9 @@ wrangler secret put CTYUN_URI_EDGE
 For GitHub Actions deployment, set the repository secret `CLOUDFLARE_API_TOKEN`.
 
 All tunable variables (`BATCH_SIZE`, `SEND_PARALLELISM`, `SEND_FETCH_TIMEOUT_MS`,
-retry / re-drive delays, `RAW_LOG_PREFIX`/`SUFFIX`, `PUSH_START_TIME`, etc.) carry
-sensible defaults and are documented inline in `wrangler.toml`; normally you only
-change the per-domain identifiers above.
+retry / re-drive delays, `RAW_LOG_PREFIX`/`SUFFIX`, etc.) carry sensible defaults and
+are documented inline in `wrangler.toml`; normally you only change the per-domain
+identifiers above.
 
 ## Output format
 
@@ -77,16 +78,6 @@ change the per-domain identifiers above.
   invocation open. Failed parse/send messages retry with a delay before, as a last
   resort, being dead-lettered and then auto-re-driven (above).
 - The parser ignores non-raw R2 objects (defaults: only `logs/…*.log.gz`).
-
-## PUSH_START_TIME
-
-`PUSH_START_TIME` controls when forwarding begins:
-
-| Value | Behavior |
-|---|---|
-| Empty (default) | No filtering; process all new logs |
-| Future ISO time | Skip files/records before that time until cutover |
-| Past ISO time | On the per-minute cron, scan `logs/YYYYMMDD/` once and re-enqueue files in `[PUSH_START_TIME, now]` (one-shot, idempotent, capped at 62 days) |
 
 ## Deploy
 

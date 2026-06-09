@@ -27,8 +27,6 @@
  *    防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
  *
  *  关键机制：
- *    - PUSH_START_TIME 时间过滤（未来/过去双模式）
- *    - Scheduled handler 自动补传（一次性 + 幂等 marker）
  *    - send-queue 同 batch 内串行 + .done 标记保证 at-least-once 幂等
  *    - Queue send 失败回滚 R2 临时文件
  *    - resp.body.cancel() 防 stalled HTTP response
@@ -39,7 +37,7 @@
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
- *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME, PUSH_START_TIME,
+ *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME,
  *                FIELD11_SERVER_IP, SEND_PARALLELISM, SEND_FETCH_TIMEOUT_MS,
  *                RETRY_DELAY_SECONDS, REDRIVE_BASE_DELAY_SECONDS,
  *                REDRIVE_MAX_DELAY_SECONDS, REDRIVE_JITTER_SECONDS
@@ -173,9 +171,9 @@ const RAW_LOG_PREFIX = 'logs/';
 const RAW_LOG_SUFFIX = '.log.gz';
 const DEFAULT_BATCH_SIZE = 1000;
 const MAX_BATCH_SIZE = 2000;
-const MAX_RECOVERY_DAYS = 62;
 const LOG_LEVELS   = Object.freeze({ debug:0, info:1, warn:2, error:3 });
 // ─── 主入口 ────────────────────────────────────────────────────────────────
+// 纯实时管道：实时性由 R2 Event Notification（仅对新建对象触发）驱动；只有 queue 消费者，无 scheduled/cron。
 export default {
   async queue(batch, env, ctx) {
     if      (batch.queue === env.PARSE_QUEUE_NAME) await handleParseQueue(batch, env);
@@ -184,9 +182,6 @@ export default {
     else if (env.PARSE_DLQ_NAME && batch.queue === env.PARSE_DLQ_NAME) await handleDlqRedrive(batch, env, env.PARSE_QUEUE, env.PARSE_QUEUE_NAME, 'parse');
     else if (env.SEND_DLQ_NAME  && batch.queue === env.SEND_DLQ_NAME)  await handleDlqRedrive(batch, env, env.SEND_QUEUE,  env.SEND_QUEUE_NAME,  'send');
     else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME/PARSE_DLQ_NAME/SEND_DLQ_NAME`);
-  },
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleScheduled(env));
   },
 };
 
@@ -270,38 +265,14 @@ async function processFile(msg, env) {
     return;
   }
 
-  // ─── PUSH_START_TIME 文件级过滤 ───────────────────────────────────────────
-  // 环境变量未设置或为空时，跳过过滤，正常处理所有文件（默认行为）
-  // 设置后，根据文件名中的时间戳对整个文件做预判断，避免不必要的 R2 读取
-  // 文件名格式: logs/YYYYMMDD/YYYYMMDDTHHmmssZ_YYYYMMDDTHHmmssZ_xxxx.log.gz
-  // 一次性逻辑：当所有新文件时间都 >= startMs 时，此过滤永远不触发，无性能损耗
-  const startMs = getPushStartMs(env);
-  if (startMs !== null) {
-    const fileEndMs = parseFileEndTime(key);
-    if (fileEndMs !== null && fileEndMs < startMs) {
-      log(env, 'info', `Skipped (before PUSH_START_TIME): ${key}`);
-      msg.ack();
-      return;
-    }
-  }
-  // ─────────────────────────────────────────────────────────────────────────
-
   log(env, 'info', `Parsing: ${key}`);
   try {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
-    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0, skipped = 0;
+    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
-      // 逐行时间过滤：仅用于文件跨越 startMs 的边界情况
-      if (startMs !== null) {
-        const recMs = parseTimestamp(record.EdgeStartTimestamp);
-        if (recMs !== null && recMs < startMs) {
-          skipped++;
-          return;
-        }
-      }
       try {
         lines.push(transformEdge(record, env));
       } catch (e) {
@@ -319,7 +290,7 @@ async function processFile(msg, env) {
     });
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
-    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount} skipped=${skipped}`);
+    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount}`);
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
@@ -659,223 +630,6 @@ async function writeDoneMarker(env, key) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ─── PUSH_START_TIME 辅助函数 ─────────────────────────────────────────────
-// 解析环境变量 PUSH_START_TIME，返回毫秒时间戳，未设置时返回 null
-// 支持 ISO 8601 格式，如 "2026-04-15T10:00:00Z" 或 "2026-04-15T18:00:00+08:00"
-function getPushStartMs(env) {
-  const v = env.PUSH_START_TIME;
-  if (!v || !v.trim()) return null;
-  const ms = new Date(v.trim()).getTime();
-  if (isNaN(ms)) {
-    console.warn(`[WARN] Invalid PUSH_START_TIME: "${v}", filtering disabled`);
-    return null;
-  }
-  return ms;
-}
-
-// 从 R2 文件名中解析文件结束时间（毫秒）
-// 文件名格式: logs/20260415/20260415T100000Z_20260415T100060Z_xxxx.log.gz
-// 第二个时间戳为文件结束时间，用于文件级快速预判断
-// 解析失败时返回 null，退化为逐行过滤
-function parseFileEndTime(key) {
-  // 匹配文件名中的第二个时间戳（ISO基本格式：YYYYMMDDTHHmmssZ）
-  const m = key.match(/\d{8}T\d{6}Z_(\d{8}T\d{6}Z)/);
-  if (!m) return null;
-  // 转换为 ISO 8601 扩展格式让 Date 可以解析
-  const s = m[1]; // e.g. "20260415T100060Z"
-  const iso = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
-  const ms = new Date(iso).getTime();
-  return isNaN(ms) ? null : ms;
-}
-
-// 从 R2 文件名中解析文件开始时间（毫秒）
-// 第一个时间戳为文件开始时间，用于补救恢复时判断文件是否在目标时间范围内
-function parseFileStartTime(key) {
-  const m = key.match(/(\d{8}T\d{6}Z)_\d{8}T\d{6}Z/);
-  if (!m) return null;
-  const s = m[1];
-  const iso = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
-  const ms = new Date(iso).getTime();
-  return isNaN(ms) ? null : ms;
-}
-
-// ─── Scheduled 处理：Cron 每分钟触发一次，检查是否需要补传历史日志 ─────────
-// 触发补救的条件（全部满足）：
-//   1. PUSH_START_TIME 已设置
-//   2. 其值 < 当前时间（过去时间）
-//   3. 该时间值对应的完成标记 .recover-done-<时间> 在 R2 中不存在
-// 满足条件时：扫描 R2 logs/ 目录 → 筛选时间范围匹配的文件 → 批量入队 parse-queue
-// 执行成功后写入完成标记；失败不写 done，下一次 Cron 自动重试
-const RECOVER_MARKER_PREFIX = '.recover-done-';
-const RECOVER_RUNNING_PREFIX = '.recover-running-';
-const RECOVER_RUNNING_STALE_MS = 15 * 60 * 1000;
-
-async function handleScheduled(env) {
-  const startMs = getPushStartMs(env);
-  if (startMs === null) {
-    // 未设置或格式错误，秒级返回
-    return;
-  }
-  const now = Date.now();
-  if (startMs > now) {
-    // 未来时间，无需恢复
-    return;
-  }
-  const recoveryDays = getRecoveryDayCount(startMs, now);
-  if (recoveryDays > MAX_RECOVERY_DAYS) {
-    log(env, 'error', `[SCHEDULED] Recovery range ${recoveryDays} days exceeds ${MAX_RECOVERY_DAYS}-day safety limit; use dedicated backfill worker`);
-    return;
-  }
-  // 过去时间，检查幂等标记
-  const v = env.PUSH_START_TIME.trim();
-  const encoded = encodeURIComponent(v);
-  const markerKey = `${RECOVER_MARKER_PREFIX}${encoded}`;
-  const runningKey = `${RECOVER_RUNNING_PREFIX}${encoded}`;
-  const existing = await env.RAW_BUCKET.head(markerKey).catch(() => null);
-  if (existing) {
-    // 已执行过，跳过
-    return;
-  }
-
-  const running = await env.RAW_BUCKET.head(runningKey).catch(() => null);
-  const runningUploadedMs = running?.uploaded ? new Date(running.uploaded).getTime() : 0;
-  if (running && runningUploadedMs && now - runningUploadedMs < RECOVER_RUNNING_STALE_MS) {
-    log(env, 'info', `[SCHEDULED] Recovery already running: PUSH_START_TIME=${v}`);
-    return;
-  }
-
-  log(env, 'info', `[SCHEDULED] Recovery started: PUSH_START_TIME=${v}, scanning R2 for files from that time to now`);
-
-  // 先写 running 标记，降低重复 Cron 并发；失败时删除，成功后写 done。
-  try {
-    await env.RAW_BUCKET.put(runningKey, JSON.stringify({
-      pushStartTime: v,
-      startedAt: new Date().toISOString(),
-    }), {
-      httpMetadata: { contentType: 'application/json' },
-    });
-  } catch (e) {
-    log(env, 'error', `[SCHEDULED] Failed to write marker, aborting: ${e.message}`);
-    return;
-  }
-
-  // 执行恢复
-  let result;
-  try {
-    result = await recoverLogs(env, startMs, now);
-    if (result.errors > 0 || result.enqueued !== result.matched) {
-      throw new Error(`Recovery incomplete: ${JSON.stringify(result)}`);
-    }
-  } catch (e) {
-    log(env, 'error', `[SCHEDULED] Recovery failed: ${e.message}`);
-    await env.RAW_BUCKET.delete(runningKey).catch(() => {});
-    return;
-  }
-
-  // 更新标记，记录完成结果
-  try {
-    await env.RAW_BUCKET.put(markerKey, JSON.stringify({
-      pushStartTime: v,
-      startedAt: new Date().toISOString(),
-      completedAt: new Date().toISOString(),
-      result,
-    }), {
-      httpMetadata: { contentType: 'application/json' },
-    });
-  } catch (e) {
-    log(env, 'error', `[SCHEDULED] Recovery done marker write failed; will retry after running marker becomes stale: ${e.message}`);
-    return;
-  }
-  await env.RAW_BUCKET.delete(runningKey).catch(() => {});
-
-  log(env, 'info', `[SCHEDULED] Recovery done: ${JSON.stringify(result)}`);
-}
-
-// 扫描 R2 目录，把时间范围内的文件批量入队到 parse-queue
-// 为避免全桶扫描，按日期拆分 prefix（logs/YYYYMMDD/）
-async function recoverLogs(env, startMs, endMs) {
-  const prefixes = getR2PrefixesByDay(startMs, endMs, env);
-  let scanned = 0;
-  let matched = 0;
-  let enqueued = 0;
-  let errors = 0;
-
-  for (const prefix of prefixes) {
-    let cursor;
-    do {
-      const page = await env.RAW_BUCKET.list({ prefix, limit: 1000, cursor });
-
-      const toEnqueue = [];
-      for (const obj of page.objects) {
-        scanned++;
-        const key = obj.key;
-        // 仅恢复原始 Logpush 文件，避免 processed/ 和 marker 被误处理。
-        if (!isRawLogKey(key, env)) continue;
-
-        const fileStartMs = parseFileStartTime(key);
-        const fileEndMs = parseFileEndTime(key);
-        if (fileStartMs === null || fileEndMs === null) continue;
-
-        // 文件时间 [fileStartMs, fileEndMs] 与目标 [startMs, endMs] 有重叠
-        if (fileStartMs <= endMs && fileEndMs >= startMs) {
-          matched++;
-          // bucket 字段仅为与 R2 Event Notification 原生消息格式保持一致
-          // Parser 实际通过 env.RAW_BUCKET binding 访问，不读 bucket 字段
-          toEnqueue.push({
-            body: { bucket: env.R2_BUCKET_NAME || 'cdn-logs-raw', object: { key } },
-          });
-        }
-      }
-
-      // 批量入队，每批最多 100（Queue sendBatch 限制）
-      for (let i = 0; i < toEnqueue.length; i += 100) {
-        const batch = toEnqueue.slice(i, i + 100);
-        try {
-          await env.PARSE_QUEUE.sendBatch(batch);
-          enqueued += batch.length;
-        } catch (e) {
-          errors += batch.length;
-          log(env, 'warn', `[RECOVER] Batch enqueue failed (${batch.length} msgs): ${e.message}`);
-        }
-      }
-
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-  }
-
-  return { prefixes, scanned, matched, enqueued, errors };
-}
-
-// 根据时间范围生成 R2 list 所需的日期 prefix 列表（避免全桶扫描）
-// 以 UTC 日期为边界（R2 文件名中的时间戳是 UTC）
-function getR2PrefixesByDay(startMs, endMs, env) {
-  const prefixes = [];
-  const rawPrefix = env?.RAW_LOG_PREFIX || RAW_LOG_PREFIX;
-  const prefixBase = rawPrefix.endsWith('/') ? rawPrefix : `${rawPrefix}/`;
-  const d = new Date(startMs);
-  d.setUTCHours(0, 0, 0, 0);
-  const endDay = new Date(endMs);
-  endDay.setUTCHours(0, 0, 0, 0);
-  // 最多遍历 62 天，防止误配置导致过量扫描
-  let iter = 0;
-  while (d.getTime() <= endDay.getTime() && iter++ < 62) {
-    const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    prefixes.push(`${prefixBase}${yyyy}${mm}${dd}/`);
-    d.setUTCDate(d.getUTCDate() + 1);
-  }
-  return prefixes;
-}
-
-function getRecoveryDayCount(startMs, endMs) {
-  const start = new Date(startMs);
-  start.setUTCHours(0, 0, 0, 0);
-  const end = new Date(endMs);
-  end.setUTCHours(0, 0, 0, 0);
-  return Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
 }
 
 // #10 finalize_error_code: 该字段为nginx/ATS架构特有的连接中断错误码

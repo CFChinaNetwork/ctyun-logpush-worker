@@ -101,11 +101,6 @@ max_concurrency    = 1
 #   ⚠️ 多域名部署：每个域名把这 4 个名字 + 上方 4 个 consumer 的 queue + producer 的 queue
 #      统一替换为带域名后缀的名字（如 parse-queue-<domain> / parse-dlq-<domain>），保持一一对应。
 #
-# PUSH_START_TIME：统一时间点推送控制（一个变量，两种模式）
-#   - 空字符串（默认）：不过滤，正常处理所有日志
-#   - 未来时间：到达该时间点后自动开始推送，之前的日志静默跳过
-#   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
-#   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）或 "2026-04-15T18:00:00+08:00"（北京时间）
 # FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
 # SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 120000=120s，范围 1000~120000）。仅用于 abort 完全
 #   hang 的接收端（实测 invocation P999≈82s，远低于 15min wall 上限，120s 安全且给慢接收端留足余量）。
@@ -121,7 +116,6 @@ BATCH_SIZE       = "2000"            # 每批 2000 行。⚠️ 改此值前须�
 RAW_LOG_PREFIX   = "logs/"          # 仅处理匹配此前缀的 R2 原始日志对象
 RAW_LOG_SUFFIX   = ".log.gz"        # 仅处理匹配此后缀的 R2 原始日志对象
 LOG_LEVEL        = "info"
-PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
 SEND_FETCH_TIMEOUT_MS = "120000"     # 单次发送 fetch 超时(ms)，默认 120s（P999≈82s，wall 余量足）
@@ -129,12 +123,6 @@ RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败�
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)
 REDRIVE_MAX_DELAY_SECONDS  = "3600"  # DLQ 重驱动退避封顶(s)
 REDRIVE_JITTER_SECONDS     = "30"    # DLQ 重驱动抖动(s)，防 thundering herd
-
-# ─── Cron 触发器 ─────────────────────────────────────────────────────────────
-# 每分钟触发一次 scheduled handler，用于检查是否需要触发历史日志补传
-# 补传仅在 PUSH_START_TIME 为过去时间且未执行过时触发，其他情况秒级返回
-[triggers]
-crons = ["* * * * *"]
 
 # ─── Observability（Workers Logs）─────────────────────────────────────────────
 # enabled = true：顶层总开关；不设或为 false 时新版统一 Logs 不会持久化数据，
