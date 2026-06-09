@@ -1,21 +1,40 @@
 # ctyun-logpush-worker
 
-Cloudflare Worker that transforms Cloudflare Logpush `http_requests` logs into the CDN partner 145-field format and forwards them to the customer log ingestion endpoint.
+A Cloudflare Worker that transforms Cloudflare Logpush `http_requests` logs into the
+CDN partner 145-field format and forwards them, in near real time, to the customer's
+log ingestion endpoint.
 
 ## Flow
 
 ```text
-Cloudflare Logpush -> R2 logs/
-  -> R2 Event Notification -> parse-queue
-  -> Parser Worker -> R2 processed/*.txt
-  -> send-queue -> Sender Worker -> gzip + auth_key POST -> customer endpoint
+Cloudflare Logpush ─▶ R2 logs/
+   └─ R2 Event Notification ─▶ parse-queue ─▶ [Parser] ─▶ R2 processed/*.txt
+                                                 └─▶ send-queue ─▶ [Sender] ─▶ gzip + auth_key POST ─▶ customer endpoint
 ```
 
-Configure the R2 Event Notification for raw Logpush objects only: `object-create` with prefix `logs/`. Notifying on the full bucket would feed `processed/` files and marker files back into `parse-queue`.
+A single Worker script acts as the **parser** (consumes `parse-queue`), the **sender**
+(consumes `send-queue`), and the **DLQ re-driver** (consumes `parse-dlq` / `send-dlq`).
+R2 `processed/*.txt` holds each batch payload, so the queue messages only carry a key
+(messages are capped at 128 KB).
 
-## Configure
+Configure the R2 Event Notification for raw Logpush objects **only**: `object-create`
+with prefix `logs/`. Notifying on the whole bucket would feed `processed/` and marker
+files back into `parse-queue`.
 
-Edit `wrangler.toml` (`account_id`, `name`, R2 `bucket_name` and `R2_BUCKET_NAME`, queue names if customised) and set the three secrets:
+## Per-domain configuration
+
+This template is deployed once **per domain**. For each domain, edit `wrangler.toml`
+(every field is documented inline) and set the secrets. Treat `<domain>` as the
+hostname identifier, e.g. `id-upload-appstore-vivoglobal`.
+
+| In `wrangler.toml` | Set to |
+|---|---|
+| `name` | `<domain>-com-log` |
+| `account_id` | the Cloudflare account ID the domain lives in |
+| R2 `bucket_name` **and** `[vars].R2_BUCKET_NAME` | `<domain>-com` (must match) |
+| Queue names — 2 producers, 4 consumers, and the 4 `[vars]` `*_QUEUE_NAME` / `*_DLQ_NAME` | `parse-queue-<domain>`, `send-queue-<domain>`, `parse-dlq-<domain>`, `send-dlq-<domain>` (keep all references consistent) |
+
+Secrets (per domain):
 
 ```bash
 wrangler secret put CTYUN_ENDPOINT
@@ -23,35 +42,51 @@ wrangler secret put CTYUN_PRIVATE_KEY
 wrangler secret put CTYUN_URI_EDGE
 ```
 
-For GitHub Actions deployment, also set repository secret `CLOUDFLARE_API_TOKEN`.
+For GitHub Actions deployment, set the repository secret `CLOUDFLARE_API_TOKEN`.
 
-Per-variable semantics (BATCH_SIZE, RAW_LOG_PREFIX/SUFFIX, etc.) are documented inline in `wrangler.toml`.
+All tunable variables (`BATCH_SIZE`, `SEND_PARALLELISM`, `SEND_FETCH_TIMEOUT_MS`,
+retry / re-drive delays, `RAW_LOG_PREFIX`/`SUFFIX`, `PUSH_START_TIME`, etc.) carry
+sensible defaults and are documented inline in `wrangler.toml`; normally you only
+change the per-domain identifiers above.
 
-## Output Format
+## Output format
 
 - 145 fields separated by `\u0001`, per CDN partner log interface v3.0.
 - HTTP body is gzip-compressed; `auth_key = ts-rand-md5(uri-ts-rand-privateKey)`.
-- Field #45 maps `EdgeColoCode` to country; unmapped values fall back to `SG`.
+- Field #45 maps `EdgeColoCode` to a country code; unmapped values fall back to `SG`.
 
-## Reliability Notes
+## How it works
 
-- Queue delivery is at-least-once. `.done` markers in R2 narrow the duplicate-POST window from Queue redelivery.
-- `send-queue` consumer leaves `max_concurrency` unset to allow autoscaling; messages within each invocation are processed by a small parallel pool (`SEND_PARALLELISM`, default 2).
-- Sender uses streaming gzip + chunked request body. **Customer endpoint must accept HTTP/1.1 `Transfer-Encoding: chunked`** (no `Content-Length`). If you see HTTP `400`/`411`/`415`, the endpoint does not support chunked bodies and the customer side needs to enable it.
-- Each `fetch` to the customer endpoint is bounded by `AbortSignal.timeout(60_000)`. A hang on the receiver side is aborted after 60s and falls back to queue retry, preventing a single invocation from exhausting the Queue consumer's 15-minute wall-time limit.
-- The parser ignores non-raw R2 objects (defaults: only `logs/...*.log.gz`).
+- **Exactly-once-in-effect delivery.** Queue delivery is at-least-once; a deterministic
+  per-batch key plus a `.done` marker in R2 make re-processing idempotent, so a batch is
+  never POSTed twice. The receiver does **not** need its own de-duplication.
+- **Self-healing dead-letter handling.** `parse-dlq` and `send-dlq` are consumed by the
+  same Worker, which re-drives messages back to their source queue with exponential
+  backoff + jitter. Transient failures recover automatically — no alerts, no manual
+  draining, no permanent gaps.
+- **Bounded per-invocation work.** The parser handles **one file per invocation**
+  (`max_batch_size = 1`), keeping memory and CPU per invocation predictable regardless of
+  file size or per-record size. Throughput scales horizontally via consumer autoscaling
+  (`max_concurrency` left unset, per-queue limit 250).
+- **Streaming send.** The sender streams `R2 object → gzip → fetch body`, so memory per
+  request stays small. The request uses HTTP/1.1 `Transfer-Encoding: chunked` (no
+  `Content-Length`). **The customer endpoint must accept chunked request bodies**; HTTP
+  `400`/`411`/`415` means it does not, and the receiver must enable it.
+- **Timeouts & retries.** Each send `fetch` is bounded by `SEND_FETCH_TIMEOUT_MS`
+  (default 120s) so a stalled receiver is aborted and retried rather than holding an
+  invocation open. Failed parse/send messages retry with a delay before, as a last
+  resort, being dead-lettered and then auto-re-driven (above).
+- The parser ignores non-raw R2 objects (defaults: only `logs/…*.log.gz`).
 
 ## PUSH_START_TIME
 
-`PUSH_START_TIME` controls when forwarding starts:
+`PUSH_START_TIME` controls when forwarding begins:
 
 | Value | Behavior |
 |---|---|
-| Empty string | No filtering; process all new logs |
+| Empty (default) | No filtering; process all new logs |
 | Future ISO time | Skip files/records before that time until cutover |
-| Past ISO time | Cron scans `logs/YYYYMMDD/` once and re-enqueues files in `[PUSH_START_TIME, now]` |
-
-Past-time recovery is one-shot per exact `PUSH_START_TIME` value and capped at 62 days. For wider ranges or precise `[A, B]` backfill use [`CFChinaNetwork/ctyun-logpush-backfill`](https://github.com/CFChinaNetwork/ctyun-logpush-backfill).
+| Past ISO time | On the per-minute cron, scan `logs/YYYYMMDD/` once and re-enqueue files in `[PUSH_START_TIME, now]` (one-shot, idempotent, capped at 62 days) |
 
 ## Deploy
 
@@ -65,5 +100,5 @@ npx wrangler deploy --dry-run
 
 | Language | Guide |
 |---|---|
-| English | [CF Logpush - Format Transform & Push Guide](https://cfchinanetwork.github.io/ctyun-logpush-worker/docs/CF-Logpush-Format-Transform-and-Push-Guide.html) |
+| English | [CF Logpush – Format Transform & Push Guide](https://cfchinanetwork.github.io/ctyun-logpush-worker/docs/CF-Logpush-Format-Transform-and-Push-Guide.html) |
 | Chinese | [CF 日志格式转换与自动推送指南](https://cfchinanetwork.github.io/ctyun-logpush-worker/docs/CF%E6%97%A5%E5%BF%97%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E4%B8%8E%E8%87%AA%E5%8A%A8%E6%8E%A8%E9%80%81%E6%8C%87%E5%8D%97.html) |
