@@ -43,19 +43,19 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# 【设计依据：2026-06 全量实测两账号 261 个域名，确认 gap 有两类根因，且都是「单次 invocation 资源」问题】
-#   1) 内存型 OOM(exceededMemory)：id-upload / id-update（大行 ~4KB），旧版 batch=3 并行解析时
-#      峰值内存 = batch_size × 多份拷贝，多个 invocation 撞同一 isolate → 超 128MB。
-#   2) CPU型 资源超限(exceededResources)：asia-vcode-od（单文件 10 万行、289MB），batch=3 一次转 30 万行，
-#      cpuTime P99≈31s 逼近 60s 限；6/3 一次事件丢了 2.7 万文件。img/magazine 同类。
-#   → 两类都因「单次 invocation 同时扛 batch 内多个文件」。【正确修复 = max_batch_size=1】：
-#      一次只处理 1 文件，把单次内存和 CPU 都砍到 1/3 → 同时根治两类。idempotency 不受影响(不动 BATCH_SIZE)。
-#   → 【不靠限并发，故意不设 max_concurrency】：实测大域名(asia-vcode-od)需 ~200 send 并发才能实时转发；
-#      并发限是【每队列 250】(已查文档)，batch=1 后 parse 约需 ~42 并发，远在 parse-queue 自己的 250 内、
-#      不与 send 抢额度；autoscaler 会自动横向扩，吞吐不变（CF 文档亦推荐慢消费者减小 batch 以改善扩缩）。
-#   max_retries 2→5：给瞬时失败更多恢复机会(index.js retry 带 delaySeconds 退避)；耗尽进 parse-dlq，
-#   再由 handleDlqRedrive 全自动延迟回灌自愈。
-# 注：若个别域名单文件极大、batch=1 仍逼近 60s CPU，可按域名上调 [limits].cpu_ms（Enterprise 最高 300000=5min）。
+# 【设计依据：2026-06 全量实测两账号 261 个域名。gap 有两类，都属「单次 invocation 资源占用过高」】
+#   1) 内存型 OOM(exceededMemory，已实测确认)：id-upload / id-update（大行 ~4KB），旧版 batch=3 并行解析
+#      峰值内存 = batch_size × 多份拷贝，多 invocation 撞同 isolate → 超 128MB。
+#   2) 大文件/资源密集型：asia-vcode-od / img / magazine（单文件 7万~10万行、~290MB），CPU 重
+#      （success cpuTime P99≈29-31s，约为 id-upload 的 6 倍），DLQ 是 6/2-6/5 的一次性事件(6/3 峰值)，
+#      现已平息。⚠️ 注：该事件的确切触发【未能锁定】——exceededResources 实测 cpuTime 仅 35-38s(未撞 60s)、
+#      wall<900s、子请求<1000，均未撞已知硬限；观测日志被采样、metrics 已过保留期。故下面是【降风险】非【已证根因】。
+#   → 共性是「单次 invocation 同时扛 batch 内多文件」。【修复 = max_batch_size=1】：一次只处理 1 文件，
+#      把单次内存/CPU/子请求都降到 ~1/3，对【任何】资源都增加余量；idempotency 不受影响(不动 BATCH_SIZE)。
+#   → 【不设 max_concurrency】：实测大域名(asia-vcode-od)需 ~200 send 并发才能实时转发；并发限是【每队列 250】
+#      (已查文档)，batch=1 后 parse 约需 ~42 并发，在 parse-queue 自己的 250 内、不与 send 抢；autoscaler 自动扩。
+#   max_retries 2→5 + index.js retry delaySeconds 退避；耗尽进 parse-dlq → handleDlqRedrive 全自动回灌自愈。
+#   外加 [limits].cpu_ms 已上调到 Enterprise 上限 300000，进一步增大 CPU 余量。
 [[queues.consumers]]
 queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
 max_batch_size     = 1               # 单 invocation 只解析 1 文件：同时把内存和 CPU 降到 1/3，根治 OOM + 资源超限两类
@@ -149,8 +149,10 @@ enabled         = true
 invocation_logs = true
 
 # ─── CPU 时间上限 ─────────────────────────────────────────────────────────────
-# 默认 30 秒，Enterprise 最高可提至 5 分钟（300000）
-# 设 60 秒给单个大文件处理（~100K 行 / ~50MB gzip）提供 2x 安全余量
-# 适配大流量客户场景：6000+ req/s 产生的 Logpush 单文件可能接近 100K 行
+# 设为 Enterprise 最大值 300000ms（5 分钟），给大文件域名（asia-vcode-od/img/magazine：
+#   单文件 7万~10万行）留最大 CPU 余量。实测 batch=1 下单文件 cpuTime ~10s、success P99=31s，
+#   300s 限即有 ~10-30x 余量，杜绝因 CPU 时间被杀。
+# 注：6/2-6/5 那批 DLQ 事件中 exceededResources 的 cpuTime 实测仅 35-38s（未撞 60s），即当时
+#   CPU 时间并非绑定瓶颈；上调 cpu_ms 是防御性最大余量，不是已证实的唯一解（确切触发未锁定）。
 [limits]
-cpu_ms = 60000
+cpu_ms = 300000

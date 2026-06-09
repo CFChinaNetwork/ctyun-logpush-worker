@@ -192,14 +192,15 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  // 单次 invocation 资源控制（关键修复，2026-06 全量实测定位）：
-  // gap 有两类根因，都源于「单次 invocation 同时扛 batch 内多个文件」：
-  //   1) 内存型 OOM：大行域名(id-upload/update, ~4KB/行)，旧版 batch=3 并行 → 峰值内存 = batch × 多份拷贝
-  //      (2000 行数组 + join 串 + R2 put body)，多 invocation 撞同 isolate → 超 128MB → exceededMemory。
-  //   2) CPU型 资源超限：超大文件域名(asia-vcode-od, 单文件 10 万行)，batch=3 一次转 30 万行 →
-  //      cpuTime P99≈31s 逼近 60s 限 → exceededResources。两类都【不是并发问题】(大域名 ~200 并发零 OOM)。
-  // 主修复 = wrangler max_batch_size=1：一次只处理 1 文件，把单次内存和 CPU 都降到 1/3 → 同治两类。
-  // 本处串行循环是【双保险】：即使将来有人调大 batch_size，单次峰值内存/CPU 仍只取决于「同一时刻一个文件」。
+  // 单次 invocation 资源控制（关键修复，2026-06 全量实测）：
+  // gap 有两类，共性是「单次 invocation 同时扛 batch 内多个文件」，单次资源占用过高：
+  //   1) 内存型 OOM（已实测确认）：大行域名(id-upload/update, ~4KB/行)，旧版 batch=3 并行 → 峰值内存
+  //      = batch × 多份拷贝(2000 行数组 + join 串 + R2 put body)，多 invocation 撞同 isolate → 超 128MB。
+  //   2) 大文件/资源密集型：asia-vcode-od/img/magazine(单文件 7万~10万行)，CPU 重(success cpuP99≈29-31s)，
+  //      DLQ 是 6/2-6/5 一次性事件、现已平息；⚠️确切触发未锁定(exceededResources 实测 cpuTime 仅 35-38s，
+  //      未撞 60s；日志被采样、metrics 过期)。故 batch=1 是【降风险】(降单次 CPU/内存/子请求至 ~1/3，对任何
+  //      资源都增余量)，非已证唯一根因解。两类都【不是并发问题】(大域名 ~200 并发零 OOM)。
+  // 本处串行循环是【双保险】：即使将来有人调大 batch_size，单次峰值仍只取决于「同一时刻一个文件」。
   // 吞吐不受影响：invocation 数量由 autoscaler 横向扩（每队列上限 250，远够），大域名实时转发照常。
   // processFile 内部自 ack/retry，循环不因单文件失败中断。
   for (const msg of batch.messages) {
