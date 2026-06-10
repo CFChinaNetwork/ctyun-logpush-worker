@@ -982,6 +982,37 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><td>修改 BATCH_SIZE / RAW_LOG_PREFIX / RAW_LOG_SUFFIX / LOG_LEVEL / 超时 / 回灌延迟</td><td>编辑 <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>是</td></tr>
     <tr><td>更新 Worker 代码（<code>src/index.js</code>）</td><td><code>git push</code> → CI/CD 自动部署</td><td>是（CI/CD 处理）</td></tr>
   </table>
+
+  <h3>设计依据与调参原理（为什么这样配置）</h3>
+  <p>以下为 2026-06 全量实测两账号 261 个域名后沉淀的调参依据，便于后续维护理解各参数取值；<code>wrangler.toml</code> 中不再赘述，日常部署只需照其顶部 PER-DOMAIN CHECKLIST 操作、参数保持默认。</p>
+  <table>
+    <tr><th>场景 / 现象</th><th>实测情况</th><th>对应设置</th></tr>
+    <tr>
+      <td>内存型 OOM（<code>exceededMemory</code>，已确认）</td>
+      <td>大行域名（如 id-upload / id-update，单行约 4KB）旧版 batch 并行解析时，峰值内存 = batch × 多份拷贝，多 invocation 撞同一 isolate → 超 128MB。</td>
+      <td><code>max_batch_size = 1</code>：一次只解析 1 个文件，把单次内存 / CPU / 子请求降到约 1/3。</td>
+    </tr>
+    <tr>
+      <td>大文件 / 资源密集型</td>
+      <td>asia-vcode-od / img / magazine 等单文件 7 万~10 万行（约 290MB），CPU 重（success cpuTime P99 ≈ 29–31s，约 id-upload 的 6 倍）。该批 DLQ 是 2026-06-02~05 的一次性事件（6/3 峰值），现已平息。<strong>确切触发未能锁定</strong>：当时 <code>exceededResources</code> 实测 cpuTime 仅 35–38s（未撞 60s）、wall &lt; 900s、子请求 &lt; 1000，均未撞已知硬限；观测日志被采样、metrics 已过保留期。故下列为<strong>降风险</strong>，非已证唯一根因。</td>
+      <td><code>max_batch_size = 1</code> + <code>cpu_ms = 300000</code>（Enterprise 上限）：对任何单次资源都留出大余量。</td>
+    </tr>
+    <tr>
+      <td>并发与吞吐</td>
+      <td>大域名（asia-vcode-od）实测需约 200 send 并发才能实时转发；Queue 并发上限为<strong>每队列 250</strong>（已查文档）；batch=1 后 parse 约需 42 并发，在 parse-queue 自己的 250 内、不与 send 抢。</td>
+      <td>两个主队列<strong>故意不设 <code>max_concurrency</code></strong>（交给 autoscaler）；DLQ 消费者设 <code>max_concurrency = 1</code>（死信量小，温和排空）。</td>
+    </tr>
+    <tr>
+      <td>残留 cron 触发器</td>
+      <td>脚本改为纯事件驱动、移除 <code>scheduled</code> handler 后，历史遗留的 <code>* * * * *</code> 触发器仍每分钟触发 → 打到不存在的 handler → 每分钟 <code>scriptThrewException</code>（2026-06 灰度复现）。</td>
+      <td><code>[triggers] crons = []</code>（显式置空才会移除触发器，注释掉无效）；并保留 no-op <code>scheduled()</code> 作双保险。</td>
+    </tr>
+    <tr>
+      <td>第 11 字段 server_ip</td>
+      <td>CF 的 <code>EdgeServerIP</code> 是「边缘→源站」内部 IP，仅回源请求才有值、cache 命中为空，并非对外服务 IP，与客户验证过的格式（固定 anycast VIP）不符。</td>
+      <td>第 11 字段取 <code>FIELD11_SERVER_IP</code>（客户在 wrangler 填该域名解析 / anycast IP，语义＝nginx <code>$server_addr</code>）；<strong>必填</strong>，为空则输出 <code>-</code>。</td>
+    </tr>
+  </table>
 </section>
 
 </div>

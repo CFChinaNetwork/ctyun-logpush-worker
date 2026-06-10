@@ -984,6 +984,37 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
     <tr><td>Change BATCH_SIZE / RAW_LOG_PREFIX / RAW_LOG_SUFFIX / LOG_LEVEL / timeouts / re-drive delays</td><td>Edit <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>Yes</td></tr>
     <tr><td>Update Worker code (<code>src/index.js</code>)</td><td><code>git push</code> → CI/CD auto-deploys</td><td>Yes (handled by CI/CD)</td></tr>
   </table>
+
+  <h3>Design Rationale &amp; Tuning (Why These Settings)</h3>
+  <p>The basis below was distilled from a full 2026-06 review of all 261 domains across both accounts. It is kept here (not in <code>wrangler.toml</code>) so maintainers can understand each value; day-to-day deployment only needs the PER-DOMAIN CHECKLIST at the top of <code>wrangler.toml</code>, with parameters left at their defaults.</p>
+  <table>
+    <tr><th>Scenario / Symptom</th><th>Observed</th><th>Resulting Setting</th></tr>
+    <tr>
+      <td>Memory OOM (<code>exceededMemory</code>, confirmed)</td>
+      <td>Large-line domains (e.g. id-upload / id-update, ~4KB per line) under the old parallel batch parsing: peak memory = batch × multiple copies, multiple invocations sharing one isolate → over 128MB.</td>
+      <td><code>max_batch_size = 1</code>: parse one file per invocation, cutting per-invocation memory / CPU / subrequests to ~1/3.</td>
+    </tr>
+    <tr>
+      <td>Large-file / resource-heavy</td>
+      <td>Domains like asia-vcode-od / img / magazine have single files of 70k–100k lines (~290MB), CPU-heavy (success cpuTime P99 ≈ 29–31s, ~6× id-upload). That DLQ batch was a one-time event on 2026-06-02~05 (peak 6/3), now settled. <strong>Exact trigger never pinned down</strong>: the measured <code>exceededResources</code> cpuTime was only 35–38s (under 60s), wall &lt; 900s, subrequests &lt; 1000 — none hit a known hard limit; observability was sampled and metrics have aged out. So the settings below are <strong>risk reduction</strong>, not a proven sole root cause.</td>
+      <td><code>max_batch_size = 1</code> + <code>cpu_ms = 300000</code> (Enterprise max): large headroom for any single-invocation resource.</td>
+    </tr>
+    <tr>
+      <td>Concurrency &amp; throughput</td>
+      <td>The big domain (asia-vcode-od) needs ~200 send-concurrency to forward in real time; the Queues concurrency cap is <strong>250 per queue</strong> (per docs); after batch=1, parse needs ~42 concurrency, within parse-queue's own 250 and not competing with send.</td>
+      <td>Both main queues <strong>deliberately leave <code>max_concurrency</code> unset</strong> (autoscaler); DLQ consumers use <code>max_concurrency = 1</code> (small dead-letter volume, gentle drain).</td>
+    </tr>
+    <tr>
+      <td>Leftover cron trigger</td>
+      <td>After the script became purely event-driven and the <code>scheduled</code> handler was removed, a leftover <code>* * * * *</code> trigger still fired every minute → hit a non-existent handler → per-minute <code>scriptThrewException</code> (reproduced in the 2026-06 gray deploy).</td>
+      <td><code>[triggers] crons = []</code> (only an explicit empty array removes the trigger; commenting it out does not); plus a no-op <code>scheduled()</code> as a fail-safe.</td>
+    </tr>
+    <tr>
+      <td>Field #11 server_ip</td>
+      <td>CF's <code>EdgeServerIP</code> is the edge→origin internal IP — populated only on origin-bound requests, empty on cache hits — not the public-facing service IP, and inconsistent with the customer-validated format (a fixed anycast VIP).</td>
+      <td>Field #11 uses <code>FIELD11_SERVER_IP</code> (the domain's resolved / anycast IP filled in wrangler; semantics = nginx <code>$server_addr</code>); <strong>required</strong>, emitted as <code>-</code> if empty.</td>
+    </tr>
+  </table>
 </section>
 
 </div>

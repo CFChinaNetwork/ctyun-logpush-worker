@@ -34,6 +34,7 @@ queue names.
 | `account_id` | the Cloudflare account ID the domain lives in |
 | R2 `bucket_name` **and** `[vars].R2_BUCKET_NAME` | `<domain>-com` (must match) |
 | Queue names — 2 producers, 4 consumers, and the 4 `[vars]` `*_QUEUE_NAME` / `*_DLQ_NAME` | `parse-queue-<domain>`, `send-queue-<domain>`, `parse-dlq-<domain>`, `send-dlq-<domain>` (keep all references consistent) |
+| `[vars].FIELD11_SERVER_IP` | **Required.** The domain's resolved / anycast IP, written into log field #11 `server_ip` (e.g. `172.65.90.64`). If left empty, field #11 is emitted as `-`. |
 
 Secrets (per domain):
 
