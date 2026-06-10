@@ -7,6 +7,7 @@
 #   4) 队列名（producers 2 个 + consumers 4 个 + [vars] 4 个 *_QUEUE_NAME/*_DLQ_NAME）统一带后缀：
 #        parse-queue-<domain> / send-queue-<domain> / parse-dlq-<domain> / send-dlq-<domain>
 #   5) 三个 secret（不在本文件）：wrangler secret put CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE
+#   6) [vars].FIELD11_SERVER_IP = 该域名的解析/anycast IP（写入第 11 字段 server_ip，【必填】，如 172.65.90.64）
 #   其余 [vars] 调参（BATCH_SIZE / SEND_PARALLELISM / 超时 / 重试 / 重驱动退避）一般【保持默认即可】，
 #   仅在该域名有特殊需求时按注释微调。max_concurrency【故意全部不设】（见下方 Queue 消费者实测依据）。
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -19,6 +20,14 @@ main = "src/index.js"           # 唯一入口：流式发送(chunked) + 小并�
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
+
+# ─── Cron 触发器：本管线【纯事件驱动】，显式置空 ────────────────────────────────
+# 实时性由 R2 Event Notification（仅新建对象触发）→ queue 驱动，不需要 cron / scheduled。
+# ⚠️ 必须显式写 crons = []：CF 官方文档明确「注释掉 crons 不会移除触发器，只有 crons = [] 才会」。
+#   历史遗留的 "* * * * *" 触发器若不清除，配合「脚本已移除 scheduled handler」会每分钟抛
+#   scriptThrewException（实测 2026-06 灰度复现）。index.js 另留 no-op scheduled() 作双保险。
+[triggers]
+crons = []
 
 # ─── R2 存储桶（部署前必须确认/修改）─────────────────────────────────────────
 # bucket_name: 你在 CF R2 中创建的实际 bucket 名字
@@ -101,7 +110,9 @@ max_concurrency    = 1
 #   ⚠️ 多域名部署：每个域名把这 4 个名字 + 上方 4 个 consumer 的 queue + producer 的 queue
 #      统一替换为带域名后缀的名字（如 parse-queue-<domain> / parse-dlq-<domain>），保持一一对应。
 #
-# FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
+# FIELD11_SERVER_IP：第 11 字段 server_ip 的值，【必填】——填该域名的解析/anycast IP（如 172.65.90.64）。
+#   语义＝nginx $server_addr（对外服务 IP），对 vivo 各域名通常为同一 anycast VIP。为空则该字段输出 "-"
+#   （客户日志缺该字段，务必填）。不取 CF 的 EdgeServerIP：那是「边缘→源站」内部 IP，仅回源请求才有、cache 命中为空。
 # SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 120000=120s，范围 1000~120000）。仅用于 abort 完全
 #   hang 的接收端（实测 invocation P999≈82s，远低于 15min wall 上限，120s 安全且给慢接收端留足余量）。
 # RETRY_DELAY_SECONDS：parser/sender 失败重试的延迟秒数（默认 30）。只延迟失败的少数，不拖慢成功路径。
@@ -116,7 +127,7 @@ BATCH_SIZE       = "2000"            # 每批 2000 行。⚠️ 改此值前须�
 RAW_LOG_PREFIX   = "logs/"          # 仅处理匹配此前缀的 R2 原始日志对象
 RAW_LOG_SUFFIX   = ".log.gz"        # 仅处理匹配此后缀的 R2 原始日志对象
 LOG_LEVEL        = "info"
-FIELD11_SERVER_IP = ""
+FIELD11_SERVER_IP = ""              # 【必填】该域名解析/anycast IP（第 11 字段 server_ip，如 172.65.90.64）；为空则输出 "-"
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
 SEND_FETCH_TIMEOUT_MS = "120000"     # 单次发送 fetch 超时(ms)，默认 120s（P999≈82s，wall 余量足）
 RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数

@@ -183,6 +183,13 @@ export default {
     else if (env.SEND_DLQ_NAME  && batch.queue === env.SEND_DLQ_NAME)  await handleDlqRedrive(batch, env, env.SEND_QUEUE,  env.SEND_QUEUE_NAME,  'send');
     else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME/PARSE_DLQ_NAME/SEND_DLQ_NAME`);
   },
+  // 纯事件驱动管线不依赖 cron。保留 no-op scheduled() 作【双保险（fail-safe）】：
+  // 若某域名历史遗留的 cron 触发器尚未被 wrangler 的 [triggers] crons=[] 清除，有此 handler
+  // 即不会因「触发器存在但脚本已无 scheduled handler」而每分钟抛 scriptThrewException。
+  // 根治仍靠 wrangler.toml 的 [triggers] crons=[]（部署时移除触发器）；此处仅兜底。
+  async scheduled(controller, env, ctx) {
+    log(env, 'debug', `scheduled() no-op tick (${controller?.cron || ''}); pipeline is event-driven`);
+  },
 };
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
@@ -448,7 +455,9 @@ async function tryParse(line, onRecord, onParseError) {
 // ─── 格式转换: CF http_requests → CDN partner log format v3.0（145字段）─────────
 //
 // 字段说明:
-//   #11 server_ip:         EdgeServerIP；为空时使用 FIELD11_SERVER_IP 兜底
+//   #11 server_ip:         FIELD11_SERVER_IP（wrangler 填入该域名的解析/anycast IP，如 172.65.90.64），必填。
+//                          ⚠️不取 EdgeServerIP：按 CF 文档它是「边缘→源站」的内部 IP（仅回源请求才有值、
+//                          cache 命中为空），并非客户 server_ip($server_addr) 语义，会污染该字段。
 //   #6  request_time:      (EdgeEndTimestamp - EdgeStartTimestamp) / 1000
 //   #7  rwt_time:          OriginResponseHeaderReceiveDurationMs / 1000
 //   #8  wwt_time:          OriginRequestHeaderSendDurationMs / 1000
@@ -484,7 +493,7 @@ function transformEdge(r, env) {
     /* 8  */ fmtSec(r.OriginRequestHeaderSendDurationMs),
     /* 9  */ fmtSec(r.EdgeTimeToFirstByteMs),
     /* 10 */ finalizeErrorCode(r),
-    /* 11 */ sf(r.EdgeServerIP || env.FIELD11_SERVER_IP),
+    /* 11 */ sf(env.FIELD11_SERVER_IP),
     /* 12 */ schemeToPort(r.ClientRequestScheme),
     /* 13 */ sf(r.ClientIP),
     /* 14 */ sf(r.ClientSrcPort),
