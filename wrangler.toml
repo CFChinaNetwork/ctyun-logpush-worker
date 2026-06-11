@@ -18,6 +18,11 @@ main = "src/index.js"
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
+# 开启 Workers Trace Events Logpush：把本 worker 的 trace events（含 console.log/异常）推到
+# 独立的 Logpush job（数据集 workers_trace_events → R2），绕开 observability 的账号级
+# 5B/天→1% 采样，便于排障拿到字面日志。⚠️ 仅当账号侧已建 workers_trace_events Logpush job
+# 指向目的地(如 R2)时才真正落数据；且 China Network 的 zone 不支持（本项目为 CF Global，可用）。
+logpush = true
 
 # ─── Cron 触发器：纯事件驱动，必须【显式置空】──────────────────────────────────────
 # 实时性由 R2 Event Notification → queue 驱动，不需要 cron。注释掉 crons 无效，
