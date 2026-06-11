@@ -88,10 +88,10 @@ RAW_LOG_SUFFIX   = ".log.gz"
 LOG_LEVEL        = "info"
 SEND_PARALLELISM = "2"                              # 单次 invocation 内并行度（1=串行，建议 2，上限 8）
 SEND_FETCH_TIMEOUT_MS = "120000"                    # 单次发送 fetch 超时(ms)
-RETRY_DELAY_SECONDS = "30"                          # 失败重试延迟(s)
-REDRIVE_BASE_DELAY_SECONDS = "60"                   # DLQ 重驱动退避基数(s)
-REDRIVE_MAX_DELAY_SECONDS  = "3600"                 # DLQ 重驱动退避封顶(s)
-REDRIVE_JITTER_SECONDS     = "30"                   # DLQ 重驱动抖动(s)
+RETRY_DELAY_SECONDS = "15"                          # 失败重试延迟(s)。调小：客户监控每~10min采集一次，让瞬时失败更快重发
+REDRIVE_BASE_DELAY_SECONDS = "20"                   # DLQ 重驱动退避基数(s)。调小：死信更快回灌重发
+REDRIVE_MAX_DELAY_SECONDS  = "120"                  # DLQ 重驱动退避封顶(s)。调小：确保死信恢复远小于客户10min采集窗口（原3600=1h会让恢复迟到）
+REDRIVE_JITTER_SECONDS     = "10"                   # DLQ 重驱动抖动(s)
 
 # ─── Observability：100% 采样 + 持久化 Logs（事故回看用）──────────────────────────
 [observability]
