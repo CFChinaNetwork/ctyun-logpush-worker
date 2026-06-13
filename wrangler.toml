@@ -45,8 +45,10 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────────
-# max_batch_size=1：一次只解析 1 个文件，控住单次内存/CPU。
+# max_batch_size=1：handleParseQueue 串行处理(一次一个文件)，batch>1 不增吞吐(串行执行)，
+#   保持 1 文件/invocation → 单次峰值内存最小(大记录域名 parser OOM 的根因修复)。
 # max_concurrency 故意不设：由 autoscaler 扩缩（每队列上限 250），保证大流量域名实时转发。
+# 单文件 R2 读卡死的兜底见 [vars].PARSE_READ_TIMEOUT_MS(默认 0=关，按域名设置)。
 # 调参原理（OOM / 大文件 / 并发实测依据）见 docs/。
 [[queues.consumers]]
 queue              = "parse-queue"                  # 与 producer / [vars].PARSE_QUEUE_NAME 一致
@@ -93,6 +95,8 @@ RAW_LOG_SUFFIX   = ".log.gz"
 LOG_LEVEL        = "info"
 SEND_PARALLELISM = "2"                              # 单次 invocation 内并行度（1=串行，建议 2，上限 8）
 SEND_FETCH_TIMEOUT_MS = "120000"                    # 单次发送 fetch 超时(ms)
+PARSE_READ_TIMEOUT_MS = "0"                         # 单文件解析(R2流式读)超时(ms)；0=不限(默认,行为不变)。超时只重试该文件、不丢、不挡后续。
+#   ⚠️按域名设：小文件域名(如 id-upload,正常~25s)设 "90000" 加速 R2 抖动恢复；大文件域名(asia-vcode-od/img/magazine ~290MB,正常解析就久)保持 "0" 或设很高,否则会误杀正常解析
 RETRY_DELAY_SECONDS = "15"                          # 失败重试延迟(s)。调小：客户监控每~10min采集一次，让瞬时失败更快重发
 REDRIVE_BASE_DELAY_SECONDS = "20"                   # DLQ 重驱动退避基数(s)。调小：死信更快回灌重发
 REDRIVE_MAX_DELAY_SECONDS  = "120"                  # DLQ 重驱动退避封顶(s)。调小：确保死信恢复远小于客户10min采集窗口（原3600=1h会让恢复迟到）

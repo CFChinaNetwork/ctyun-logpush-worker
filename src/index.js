@@ -277,6 +277,10 @@ async function processFile(msg, env) {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
+    // PARSE_READ_TIMEOUT_MS>0：给单文件的 R2 流式读设上限；超时即抛错→下方 catch 对【这一个文件】msg.retry
+    //（只重试该文件、不阻塞同批后续文件、不丢数据），避免 R2 偶发变慢时单文件死等（实测见过 345s）。
+    // 默认 0=不限（行为不变）。⚠️大文件域名(~290MB 正常解析就久)误设过低会误杀，需按域名设（见 wrangler 注释）。
+    const parseTimeoutMs = parseIntegerVar(env, 'PARSE_READ_TIMEOUT_MS', 0, 0, 600000);
     let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
@@ -294,7 +298,7 @@ async function processFile(msg, env) {
     }, (line) => {
       parseErrCount++;
       if (parseErrCount <= 5) log(env, 'warn', `JSON parse failed in ${key}: ${line.substring(0, 100)}`);
-    });
+    }, parseTimeoutMs);
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
     log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount}`);
@@ -426,13 +430,32 @@ async function sendBatchUnlocked(key, env) {
   log(env, 'debug', `Deleted: ${key}`);
 }
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
-async function streamParseNdjsonGzip(inputStream, onRecord, onParseError) {
+async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, timeoutMs = 0) {
   const reader  = inputStream.pipeThrough(new DecompressionStream('gzip')).getReader();
   const decoder = new TextDecoder('utf-8');
   let   buffer  = '';
+  // timeoutMs>0：给整段流式读设「截止时间」，避免 R2 偶发变慢时单文件死等。超时抛错→上层对该文件 msg.retry。
+  // 0=不限（默认，行为与改动前完全一致）。
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      let res;
+      if (deadline) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error(`Parse read timeout after ${timeoutMs}ms`);
+        const rp = reader.read();
+        rp.catch(() => {});   // 若超时赢得 race，吞掉 read() 的滞后 rejection，避免 unhandled rejection
+        let timer;
+        try {
+          res = await Promise.race([
+            rp,
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Parse read timeout after ${timeoutMs}ms`)), remaining); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      } else {
+        res = await reader.read();
+      }
+      const { done, value } = res;
       if (done) {
         const last = buffer.trim();
         if (last) await tryParse(last, onRecord, onParseError);
@@ -446,7 +469,10 @@ async function streamParseNdjsonGzip(inputStream, onRecord, onParseError) {
         if (t) await tryParse(t, onRecord, onParseError);
       }
     }
-  } finally { reader.releaseLock(); }
+  } finally {
+    // cancel() 释放锁并（超时时）中断底层 R2 流；正常读完时为无害 no-op。不 await，避免 finally 卡住。
+    reader.cancel().catch(() => {});
+  }
 }
 async function tryParse(line, onRecord, onParseError) {
   try { await onRecord(JSON.parse(line)); }
