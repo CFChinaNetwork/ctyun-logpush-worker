@@ -501,7 +501,7 @@ Total end-to-end latency: ~75–120 seconds
   <h3>Per-Stage Trigger Mechanism</h3>
   <div class="card">
     <h4>Stage 1 — Logpush → R2 &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Time-driven, ~60s interval</span></h4>
-    <p>Logpush batches all logs from the past ~60 seconds and writes a single compressed file to R2. This is the only time-based trigger in the pipeline. All subsequent stages are event-driven.</p>
+    <p>Logpush batches all logs from the past ~60 seconds and writes a single compressed file to R2. The real-time path is then event-driven (R2 Event Notification → queues); a separate cron-driven reconciliation sweep (every minute) re-processes any object whose notification was delayed or dropped, since R2 Event Notifications are best-effort.</p>
     <p>One file per batch regardless of traffic volume — a low-traffic file may contain 3 lines; a peak-traffic file may contain hundreds of thousands of lines.</p>
 
     <h4>Stage 2 — R2 → parse-queue &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Event-driven, 1 file = 1 message</span></h4>
@@ -887,7 +887,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
 [limits]
 <span class="key">cpu_ms</span> = 300000   <span class="comment"># Enterprise max (5 min); large CPU headroom for big files</span>
 
-<span class="comment"># No [triggers]/cron — the pipeline is purely event-driven (R2 Event Notification + queues)</span>
+<span class="comment"># [triggers] crons = ["* * * * *"] — drives the scheduled() reconciliation sweep (safety net for late/dropped notifications)</span>
 <span class="comment"># workers_dev is a top-level wrangler.toml key, not [vars]</span></pre>
 
   <h3>Environment Variables</h3>
@@ -1005,9 +1005,9 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
       <td>Both main queues <strong>deliberately leave <code>max_concurrency</code> unset</strong> (autoscaler); DLQ consumers use <code>max_concurrency = 1</code> (small dead-letter volume, gentle drain).</td>
     </tr>
     <tr>
-      <td>Leftover cron trigger</td>
-      <td>After the script became purely event-driven and the <code>scheduled</code> handler was removed, a leftover <code>* * * * *</code> trigger still fired every minute → hit a non-existent handler → per-minute <code>scriptThrewException</code> (reproduced in the 2026-06 gray deploy).</td>
-      <td><code>[triggers] crons = []</code> (only an explicit empty array removes the trigger; commenting it out does not); plus a no-op <code>scheduled()</code> as a fail-safe.</td>
+      <td>cron trigger / handler mismatch</td>
+      <td>Historical lesson: the script was once made "purely event-driven" and the <code>scheduled</code> handler removed, but a leftover <code>* * * * *</code> trigger kept firing every minute → hit a non-existent handler → per-minute <code>scriptThrewException</code> (reproduced 2026-06).</td>
+      <td>The current design restores the reconciliation sweep: <code>scheduled()</code> is a real handler wrapped entirely in <code>try/catch</code> (never throws), paired with <code>[triggers] crons = ["* * * * *"]</code>. Rule: trigger and handler must match — if a cron exists, a non-throwing handler must exist too.</td>
     </tr>
     <tr>
       <td>Field #11 server_ip</td>

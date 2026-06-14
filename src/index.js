@@ -171,9 +171,18 @@ const RAW_LOG_PREFIX = 'logs/';
 const RAW_LOG_SUFFIX = '.log.gz';
 const DEFAULT_BATCH_SIZE = 1000;
 const MAX_BATCH_SIZE = 2000;
+// 单次 R2 流式读的【空闲超时】默认值（ms）。健康读每几百毫秒出块，永不触发；只有读卡死才触发。
+// 与对象大小无关 → 全域统一一个值即可，不需要按域名调。0=不限。
+const DEFAULT_PARSE_READ_IDLE_MS = 45000;
+// 补扫（reconciliation）默认参数：只兜底「事件通知漏/晚」的对象，正常路径仍是实时事件驱动。
+const RECONCILE_DEFAULT_LOOKBACK_MIN = 120; // 回看窗口（分钟）：只考虑最近这段时间落桶的对象
+const RECONCILE_DEFAULT_GRACE_SEC    = 120; // 宽限（秒）：落桶不足此时长的对象先交给事件路径，避免与之竞争
+const RECONCILE_DEFAULT_MAX_ENQUEUE  = 500; // 单次补扫最多回灌对象数（防一次性回灌过多）
 const LOG_LEVELS   = Object.freeze({ debug:0, info:1, warn:2, error:3 });
 // ─── 主入口 ────────────────────────────────────────────────────────────────
-// 纯实时管道：实时性由 R2 Event Notification（仅对新建对象触发）驱动；只有 queue 消费者，无 scheduled/cron。
+// 实时性主路径：R2 Event Notification（对新建对象触发）→ queue 消费者，~2min 端到端。
+// 兜底安全网：cron 每分钟触发 scheduled() 补扫，捕捉「事件通知漏/晚」的对象（R2 通知 best-effort，
+//   实测见过晚 53min）。两者经同一套 .done 幂等去重，互不产生重复发送。
 export default {
   async queue(batch, env, ctx) {
     if      (batch.queue === env.PARSE_QUEUE_NAME) await handleParseQueue(batch, env);
@@ -183,12 +192,16 @@ export default {
     else if (env.SEND_DLQ_NAME  && batch.queue === env.SEND_DLQ_NAME)  await handleDlqRedrive(batch, env, env.SEND_QUEUE,  env.SEND_QUEUE_NAME,  'send');
     else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME/PARSE_DLQ_NAME/SEND_DLQ_NAME`);
   },
-  // 纯事件驱动管线不依赖 cron。保留 no-op scheduled() 作【双保险（fail-safe）】：
-  // 若某域名历史遗留的 cron 触发器尚未被 wrangler 的 [triggers] crons=[] 清除，有此 handler
-  // 即不会因「触发器存在但脚本已无 scheduled handler」而每分钟抛 scriptThrewException。
-  // 根治仍靠 wrangler.toml 的 [triggers] crons=[]（部署时移除触发器）；此处仅兜底。
+  // Cron（每分钟）触发的【补扫 / reconciliation】——纯事件驱动的兜底安全网。
+  // 背景：R2 Event Notification 是 best-effort，瞬时投递失败时由 R2 内部 CronJob 重试，
+  //   可能延迟数十分钟（实测见过 53min）才把消息投到 parse-queue → 对象早已落 R2 却长时间无人处理
+  //   = 客户侧 gap。事件路径无法自愈这一类（worker 根本没被触发）。
+  // 补扫做法：扫描最近窗口内「已落桶超过 grace、却没有源级 .done 标记」的原始对象，回灌 parse-queue。
+  // 幂等：源级 .done 早退 + 批次级 .done 保证回灌不会重复发送（见 processFile / writeBatchAndEnqueue）。
+  // 安全：handleReconcile 内部全程 try/catch，永不抛出 → 不会出现 scriptThrewException；
+  //   ctx.waitUntil 让补扫在响应返回后继续完成。
   async scheduled(controller, env, ctx) {
-    log(env, 'debug', `scheduled() no-op tick (${controller?.cron || ''}); pipeline is event-driven`);
+    ctx.waitUntil(handleReconcile(env));
   },
 };
 
@@ -258,6 +271,99 @@ async function handleDlqRedrive(batch, env, targetQueue, targetName, label) {
 function retryDelaySeconds(env) {
   return parseIntegerVar(env, 'RETRY_DELAY_SECONDS', 30, 0, 43200);
 }
+
+// ─── 补扫 / reconciliation（cron 每分钟触发）────────────────────────────────────
+// 列出最近窗口内的原始对象与源级 .done 标记，挑出「落桶超过 grace 却没有 .done」的对象，回灌 parse-queue。
+// 全程 try/catch，永不抛出（避免 scheduled scriptThrewException）。
+async function handleReconcile(env) {
+  try {
+    if (!env.PARSE_QUEUE) { log(env, 'error', '[RECONCILE] PARSE_QUEUE binding missing; skip'); return; }
+    const lookbackMs = parseIntegerVar(env, 'RECONCILE_LOOKBACK_MINUTES', RECONCILE_DEFAULT_LOOKBACK_MIN, 1, 1440) * 60000;
+    const graceMs    = parseIntegerVar(env, 'RECONCILE_GRACE_SECONDS',   RECONCILE_DEFAULT_GRACE_SEC,    30, 3600) * 1000;
+    const maxEnqueue = parseIntegerVar(env, 'RECONCILE_MAX_ENQUEUE',     RECONCILE_DEFAULT_MAX_ENQUEUE,  1, 10000);
+    const now = Date.now();
+    const rawSuffix  = env?.RAW_LOG_SUFFIX || RAW_LOG_SUFFIX;
+    const doneSuffix = `${rawSuffix}.done`;
+    const prefixes = genDayPrefixes(now - lookbackMs, now, env);
+
+    const rawUploaded = new Map(); // rawKey -> uploadedMs
+    const doneSet     = new Set(); // rawKey（去掉 .done 后缀）
+    for (const prefix of prefixes) {
+      let cursor;
+      do {
+        const page = await env.RAW_BUCKET.list({ prefix, limit: 1000, cursor });
+        for (const o of (page.objects || [])) {
+          const k = o.key;
+          const up = o.uploaded ? new Date(o.uploaded).getTime() : 0;
+          if (k.endsWith(doneSuffix)) {
+            doneSet.add(k.slice(0, -('.done'.length))); // 源级完成标记
+          } else if (isRawLogKey(k, env)) {
+            rawUploaded.set(k, up);                       // 原始 Logpush 对象
+          }
+          // 其余（processed/、running marker 等）忽略
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+    }
+
+    const candidates = selectReconcileCandidates(rawUploaded, doneSet, now, lookbackMs, graceMs, maxEnqueue);
+    if (candidates.length === 0) { log(env, 'debug', '[RECONCILE] no stale objects'); return; }
+    log(env, 'warn', `[RECONCILE] re-enqueueing ${candidates.length} stale object(s) (lookback=${lookbackMs / 60000}min grace=${graceMs / 1000}s, scanned=${rawUploaded.size})`);
+
+    const bucketName = env.R2_BUCKET_NAME || 'cdn-logs-raw';
+    for (let i = 0; i < candidates.length; i += 100) { // Queue sendBatch 上限 100
+      const batch = candidates.slice(i, i + 100).map((key) => ({
+        body: { bucket: bucketName, object: { key }, __reconcile: true },
+      }));
+      try {
+        await env.PARSE_QUEUE.sendBatch(batch);
+      } catch (e) {
+        log(env, 'warn', `[RECONCILE] enqueue batch failed (${batch.length} msgs): ${e.message || e}`);
+      }
+    }
+  } catch (e) {
+    // 补扫失败必须非致命：退回纯事件驱动（gap 可能回来但不新增丢失），下一次 cron 再试。
+    log(env, 'error', `[RECONCILE] non-fatal error: ${e?.message || e}`);
+  }
+}
+
+// 纯函数（便于单测）：从「原始对象 uploaded 时间表 + 已完成集合」挑出需要回灌的对象。
+//   - 跳过已有源级 .done 的（已处理）
+//   - 跳过落桶不足 grace 的（太新，先让事件路径处理，避免竞争重复）
+//   - 跳过落桶早于 lookback 的（窗口外，避免无限重试坏对象）
+//   - uploaded 缺失(=0) 的对象视为需要处理（保守：宁可重投也不漏）
+function selectReconcileCandidates(rawUploaded, doneSet, now, lookbackMs, graceMs, maxEnqueue) {
+  const out = [];
+  const freshAfter = now - graceMs;   // uploaded 晚于此 = 太新
+  const windowStart = now - lookbackMs; // uploaded 早于此 = 窗口外
+  for (const [key, up] of rawUploaded) {
+    if (doneSet.has(key)) continue;
+    if (up && up > freshAfter) continue;
+    if (up && up < windowStart) continue;
+    out.push(key);
+    if (out.length >= maxEnqueue) break;
+  }
+  return out;
+}
+
+// 生成补扫所需的按 UTC 日期 prefix 列表（logs/YYYYMMDD/）。lookback ≤ 24h，故最多跨 2~3 个 UTC 日。
+function genDayPrefixes(startMs, endMs, env) {
+  const base = env?.RAW_LOG_PREFIX || RAW_LOG_PREFIX;
+  const prefixBase = base.endsWith('/') ? base : `${base}/`;
+  const prefixes = [];
+  const d = new Date(startMs); d.setUTCHours(0, 0, 0, 0);
+  const end = new Date(endMs); end.setUTCHours(0, 0, 0, 0);
+  let iter = 0;
+  while (d.getTime() <= end.getTime() && iter++ < 3) {
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    prefixes.push(`${prefixBase}${yyyy}${mm}${dd}/`);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return prefixes;
+}
+
 async function processFile(msg, env) {
   const key = msg.body?.object?.key;
   if (!key) {
@@ -272,15 +378,26 @@ async function processFile(msg, env) {
     return;
   }
 
+  // 源级幂等早退：若该原始对象已被完整处理过（写过源级 .done 标记），直接跳过。
+  // 应对「补扫回灌」与「迟到数十分钟的事件通知」对同一对象的重复投递 —— 避免无谓重解析，
+  // 并把潜在并发重发窗口压到最小（批次级 .done 仍是不重发的最终保证）。
+  const sourceDoneKey = `${key}.done`;
+  if (await env.RAW_BUCKET.head(sourceDoneKey).catch(() => null)) {
+    log(env, 'info', `Source already processed (skip): ${key}`);
+    msg.ack();
+    return;
+  }
+
   log(env, 'info', `Parsing: ${key}`);
   try {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
-    // PARSE_READ_TIMEOUT_MS>0：给单文件的 R2 流式读设上限；超时即抛错→下方 catch 对【这一个文件】msg.retry
-    //（只重试该文件、不阻塞同批后续文件、不丢数据），避免 R2 偶发变慢时单文件死等（实测见过 345s）。
-    // 默认 0=不限（行为不变）。⚠️大文件域名(~290MB 正常解析就久)误设过低会误杀，需按域名设（见 wrangler 注释）。
-    const parseTimeoutMs = parseIntegerVar(env, 'PARSE_READ_TIMEOUT_MS', 0, 0, 600000);
+    // PARSE_READ_IDLE_TIMEOUT_MS：给【每一次 R2 read()】设空闲超时（非整文件总时限）。健康读每几百毫秒
+    // 出块，永不触发；只有单次读卡死（连接挂住，实测纯 I/O 等待 900~1922s）才触发 → 抛错 → 下方 catch 对
+    // 【这一个文件】msg.retry（只重试该文件、不挡同批后续、不丢数据）。阈值与对象大小无关 → 全域统一一个值、
+    // 不会误杀大文件。默认 45000ms；0=不限。卡住文件不再堵住队列（06-12 那种级联的根因修复）。
+    const idleTimeoutMs = parseIntegerVar(env, 'PARSE_READ_IDLE_TIMEOUT_MS', DEFAULT_PARSE_READ_IDLE_MS, 0, 600000);
     let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
@@ -298,9 +415,12 @@ async function processFile(msg, env) {
     }, (line) => {
       parseErrCount++;
       if (parseErrCount <= 5) log(env, 'warn', `JSON parse failed in ${key}: ${line.substring(0, 100)}`);
-    }, parseTimeoutMs);
+    }, idleTimeoutMs);
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
+    // 写源级完成标记（供补扫判定「已处理」+ 重复投递早退）。复用 writeDoneMarker：写 `${key}.done`。
+    // 失败仅告警不抛（批次级 .done 仍保证不重发；下次补扫会再处理一次，靠 .done 去重）。
+    await writeDoneMarker(env, key);
     log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount}`);
     msg.ack();
   } catch (err) {
@@ -430,26 +550,26 @@ async function sendBatchUnlocked(key, env) {
   log(env, 'debug', `Deleted: ${key}`);
 }
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
-async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, timeoutMs = 0) {
+async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, idleTimeoutMs = 0) {
   const reader  = inputStream.pipeThrough(new DecompressionStream('gzip')).getReader();
   const decoder = new TextDecoder('utf-8');
   let   buffer  = '';
-  // timeoutMs>0：给整段流式读设「截止时间」，避免 R2 偶发变慢时单文件死等。超时抛错→上层对该文件 msg.retry。
-  // 0=不限（默认，行为与改动前完全一致）。
-  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
+  // idleTimeoutMs>0：给【每一次 reader.read()】设空闲超时（不是整文件总时限）。
+  // 健康的 R2 流每几百毫秒就产出一块数据，永远不会触发；只有「单次读卡死」（连接挂住，
+  // 实测纯 I/O 等待 900~1922s）才会触发 → 抛错 → 上层对该文件 msg.retry。
+  // 关键：阈值与对象大小【无关】（大文件也是连续出块），可全域统一一个值、不会误杀大文件。
+  // 每次循环重新计时（空闲口径），区别于旧版「整文件总时限」需按域名调。0=不限（旧默认行为）。
   try {
     while (true) {
       let res;
-      if (deadline) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error(`Parse read timeout after ${timeoutMs}ms`);
+      if (idleTimeoutMs > 0) {
         const rp = reader.read();
         rp.catch(() => {});   // 若超时赢得 race，吞掉 read() 的滞后 rejection，避免 unhandled rejection
         let timer;
         try {
           res = await Promise.race([
             rp,
-            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Parse read timeout after ${timeoutMs}ms`)), remaining); }),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Parse read idle timeout after ${idleTimeoutMs}ms`)), idleTimeoutMs); }),
           ]);
         } finally { clearTimeout(timer); }
       } else {

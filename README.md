@@ -8,9 +8,14 @@ log ingestion endpoint.
 
 ```text
 Cloudflare Logpush ─▶ R2 logs/
-   └─ R2 Event Notification ─▶ parse-queue ─▶ [Parser] ─▶ R2 processed/*.txt
-                                                 └─▶ send-queue ─▶ [Sender] ─▶ gzip + auth_key POST ─▶ customer endpoint
+   ├─ R2 Event Notification ─▶ parse-queue ─▶ [Parser] ─▶ R2 processed/*.txt
+   │                                              └─▶ send-queue ─▶ [Sender] ─▶ gzip + auth_key POST ─▶ customer endpoint
+   └─ cron (every 1 min) ─▶ [Reconcile sweep] ─▶ re-enqueue any logs/ object that is past
+                                                  its grace window and still has no .done ─▶ parse-queue
 ```
+
+The event-notification path is the real-time main path (~2 min end-to-end). The cron
+reconcile sweep is the safety net for objects whose notification was delayed or dropped.
 
 A single Worker script acts as the **parser** (consumes `parse-queue`), the **sender**
 (consumes `send-queue`), and the **DLQ re-driver** (consumes `parse-dlq` / `send-dlq`).
@@ -66,6 +71,16 @@ identifiers above.
   same Worker, which re-drives messages back to their source queue with exponential
   backoff + jitter. Transient failures recover automatically — no alerts, no manual
   draining, no permanent gaps.
+- **Reconciliation safety net (cron, every minute).** R2 Event Notifications are
+  best-effort: a notification can be delayed by tens of minutes (observed up to ~53 min)
+  or, rarely, dropped — so an object can sit in `logs/` unprocessed (a customer-visible
+  gap) even while the event path itself is healthy and the queues are empty. The event
+  path cannot self-heal this (the Worker is simply never triggered). A `scheduled()`
+  sweep lists recent `logs/` objects and re-enqueues any that are older than
+  `RECONCILE_GRACE_SECONDS` and still lack a source-level `.done` marker. Combined with
+  the per-batch `.done` idempotency above (and a source-level `.done` early-skip in the
+  parser), the re-enqueue never causes a duplicate send. This keeps end-to-end delivery
+  inside the customer's window even when a notification is late or missing.
 - **Bounded per-invocation work.** The parser handles **one file per invocation**
   (`max_batch_size = 1`), keeping memory and CPU per invocation predictable regardless of
   file size or per-record size. Throughput scales horizontally via consumer autoscaling
@@ -74,10 +89,16 @@ identifiers above.
   request stays small. The request uses HTTP/1.1 `Transfer-Encoding: chunked` (no
   `Content-Length`). **The customer endpoint must accept chunked request bodies**; HTTP
   `400`/`411`/`415` means it does not, and the receiver must enable it.
-- **Timeouts & retries.** Each send `fetch` is bounded by `SEND_FETCH_TIMEOUT_MS`
-  (default 120s) so a stalled receiver is aborted and retried rather than holding an
-  invocation open. Failed parse/send messages retry with a delay before, as a last
-  resort, being dead-lettered and then auto-re-driven (above).
+- **Timeouts & retries.** Each R2 read is bounded by a per-read **idle timeout**
+  (`PARSE_READ_IDLE_TIMEOUT_MS`, default 45s): a stalled read (a hung connection — observed
+  as 900–1922 s of pure I/O wait) is aborted and that single file retried, so one stuck
+  object never blocks the rest of the queue. Because it is an *idle* (per-read) timeout,
+  not a whole-file deadline, the same value is safe for every domain regardless of object
+  size — a healthy large file emits chunks continuously and never trips it. Each send
+  `fetch` is bounded by `SEND_FETCH_TIMEOUT_MS` (default 120s) so a stalled receiver is
+  aborted and retried rather than holding an invocation open. Failed parse/send messages
+  retry with a delay before, as a last resort, being dead-lettered and then
+  auto-re-driven (above).
 - The parser ignores non-raw R2 objects (defaults: only `logs/…*.log.gz`).
 
 ## Deploy

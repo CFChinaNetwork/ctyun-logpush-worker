@@ -885,7 +885,7 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
 [limits]
 <span class="key">cpu_ms</span> = 300000   <span class="comment"># Enterprise 最大（5 分钟）；为大文件留足 CPU 余量</span>
 
-<span class="comment"># 无 [triggers]/cron —— 流水线纯事件驱动（R2 Event Notification + 队列）</span>
+<span class="comment"># [triggers] crons = ["* * * * *"] —— 每分钟触发 scheduled() 补扫(reconciliation)安全网，兜底"事件通知漏/晚"的对象</span>
 <span class="comment"># workers_dev 是 wrangler.toml 顶层配置，不属于 [vars]</span></pre>
 
   <h3>环境变量说明</h3>
@@ -1003,9 +1003,9 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" 
       <td>两个主队列<strong>故意不设 <code>max_concurrency</code></strong>（交给 autoscaler）；DLQ 消费者设 <code>max_concurrency = 1</code>（死信量小，温和排空）。</td>
     </tr>
     <tr>
-      <td>残留 cron 触发器</td>
-      <td>脚本改为纯事件驱动、移除 <code>scheduled</code> handler 后，历史遗留的 <code>* * * * *</code> 触发器仍每分钟触发 → 打到不存在的 handler → 每分钟 <code>scriptThrewException</code>（2026-06 灰度复现）。</td>
-      <td><code>[triggers] crons = []</code>（显式置空才会移除触发器，注释掉无效）；并保留 no-op <code>scheduled()</code> 作双保险。</td>
+      <td>cron 触发器与 handler 不配套</td>
+      <td>历史教训：脚本曾改为"纯事件驱动"并移除 <code>scheduled</code> handler，但遗留的 <code>* * * * *</code> 触发器仍每分钟触发 → 打到不存在的 handler → 每分钟 <code>scriptThrewException</code>（2026-06 复现）。</td>
+      <td>当前设计已恢复补扫：<code>scheduled()</code> 是真实的 reconciliation handler 且内部全程 <code>try/catch</code> 永不抛出，配 <code>[triggers] crons = ["* * * * *"]</code>。规则：触发器与 handler 必须配套——有 cron 就必须有不抛异常的 handler。</td>
     </tr>
     <tr>
       <td>第 11 字段 server_ip</td>
