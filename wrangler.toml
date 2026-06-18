@@ -48,14 +48,17 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────────
-# max_batch_size=1：handleParseQueue 串行处理(一次一个文件)，batch>1 不增吞吐(串行执行)，
-#   保持 1 文件/invocation → 单次峰值内存最小(大记录域名 parser OOM 的根因修复)。
-# max_concurrency 故意不设：由 autoscaler 扩缩（每队列上限 250），保证大流量域名实时转发。
-# 单次 R2 读卡死的兜底见 [vars].PARSE_READ_IDLE_TIMEOUT_MS(空闲超时，默认 45000=开，全域统一、不必按域名调)。
-# 调参原理（OOM / 大文件 / 并发实测依据）见 docs/。
+# max_batch_size=2 + [vars].PARSE_PARALLELISM=2：handleParseQueue 用「有界并发池」在单次 invocation 内
+#   并行解析 batch 内文件(同时最多 PARSE_PARALLELISM 个)。治本(2026-06 实测)：纯串行在最大域名
+#   (asia-vcode-od ~97 对象/min)真实完成(~77/min)追不上 ingest → 持续积压、客户少收；并发池把单 invocation 吞吐×P。
+#   max_batch_size 须 ≥ PARSE_PARALLELISM 才喂得满池(=1 则退化为串行)；取 2 正好喂满、单次 CPU/内存最小。
+#   内存安全：同时最多 P 个文件、每个流式 + 每 BATCH_SIZE 行 flush → 峰值≈P×数十MB，远低于旧版整 batch 全并行 OOM。
+#   CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件CPU < limits.cpu_ms(300s)。
+# max_concurrency 故意不设：由 autoscaler 横向扩 invocation（每队列上限 250）。
+# 单次 R2 读卡死的兜底见 [vars].PARSE_READ_IDLE_TIMEOUT_MS(空闲超时，默认 45000=开，全域统一)。调参原理见 docs/。
 [[queues.consumers]]
 queue              = "parse-queue"                  # 与 producer / [vars].PARSE_QUEUE_NAME 一致
-max_batch_size     = 1
+max_batch_size     = 2
 max_batch_timeout  = 5
 max_retries        = 5
 dead_letter_queue  = "parse-dlq"
@@ -96,7 +99,8 @@ BATCH_SIZE       = "2000"                           # ⚠️ 改此值前须先�
 RAW_LOG_PREFIX   = "logs/"
 RAW_LOG_SUFFIX   = ".log.gz"
 LOG_LEVEL        = "info"
-SEND_PARALLELISM = "2"                              # 单次 invocation 内并行度（1=串行，建议 2，上限 8）
+SEND_PARALLELISM = "2"                              # send 单次 invocation 内并行【发送】度（1=串行，建议 2，上限 8）
+PARSE_PARALLELISM = "2"                             # parse 单次 invocation 内并行【解析】度（有界并发池上限）。须 ≤ parse 的 max_batch_size 才喂得满；峰值内存≈P×数十MB，上限 8
 SEND_FETCH_TIMEOUT_MS = "120000"                    # 单次发送 fetch 超时(ms)
 # 解析读卡死兜底（空闲超时口径，全域统一一个值即可，不必按域名调）：
 PARSE_READ_IDLE_TIMEOUT_MS = "45000"                # 单次 R2 read() 空闲超时(ms)；卡死才触发、与对象大小无关。超时只重试该文件、不丢、不挡同批。0=不限

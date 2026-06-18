@@ -207,20 +207,32 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  // 单次 invocation 资源控制（关键修复，2026-06 全量实测）：
-  // gap 有两类，共性是「单次 invocation 同时扛 batch 内多个文件」，单次资源占用过高：
-  //   1) 内存型 OOM（已实测确认）：大行域名(id-upload/update, ~4KB/行)，旧版 batch=3 并行 → 峰值内存
-  //      = batch × 多份拷贝(2000 行数组 + join 串 + R2 put body)，多 invocation 撞同 isolate → 超 128MB。
-  //   2) 大文件/资源密集型：asia-vcode-od/img/magazine(单文件 7万~10万行)，CPU 重(success cpuP99≈29-31s)，
-  //      DLQ 是 6/2-6/5 一次性事件、现已平息；⚠️确切触发未锁定(exceededResources 实测 cpuTime 仅 35-38s，
-  //      未撞 60s；日志被采样、metrics 过期)。故 batch=1 是【降风险】(降单次 CPU/内存/子请求至 ~1/3，对任何
-  //      资源都增余量)，非已证唯一根因解。两类都【不是并发问题】(大域名 ~200 并发零 OOM)。
-  // 本处串行循环是【双保险】：即使将来有人调大 batch_size，单次峰值仍只取决于「同一时刻一个文件」。
-  // 吞吐不受影响：invocation 数量由 autoscaler 横向扩（每队列上限 250，远够），大域名实时转发照常。
-  // processFile 内部自 ack/retry，循环不因单文件失败中断。
-  for (const msg of batch.messages) {
-    await processFile(msg, env);
-  }
+  // 有界并发池：在单次 invocation 内【并行】解析 batch 内多个文件，提升解析吞吐（治本修复）。
+  // 背景（2026-06 实测）：纯串行(一次一个文件)在最大域名(asia-vcode-od ~97 对象/min、单文件数万行)
+  //   真实完成率仅 ~77/min < ingest ~97/min → 持续积压、客户少收 ~20%。根因是串行单 invocation 吞吐太低，
+  //   autoscaler 横向扩也补不齐。改为有界并发池后单 invocation 吞吐 ×P，配合横向扩追上 ingest。
+  // 内存安全（不重蹈旧版「整 batch 全并行无界」的 OOM）：并发上限 = PARSE_PARALLELISM（默认 1=串行；
+  //   wrangler 设 2）。同一时刻最多 P 个文件在解析，每个文件仍是流式 + 每 BATCH_SIZE 行 flush →
+  //   峰值内存 ≈ P × 单文件(数十 MB)，与对象大小无关，远低于旧版。
+  //   ⚠️ 需 wrangler 的 parse consumer max_batch_size ≥ P，池才有多文件可并行（=1 则退化为串行）。
+  // CPU 安全：单次 invocation 总 CPU ≈ max_batch_size × 单文件CPU，须 < limits.cpu_ms(300s)；故 max_batch_size 不宜过大。
+  // 吞吐横向扩：invocation 数量仍由 autoscaler 按 backlog 扩（每队列上限 250）。
+  // processFile 内部自 ack/retry，单文件失败不影响同批其他文件。
+  const pool = (() => {
+    const n = Number(env?.PARSE_PARALLELISM);
+    if (!Number.isFinite(n) || n < 1) return 1;
+    return Math.min(Math.floor(n), 8); // 软上限，防误填过大导致 OOM
+  })();
+  let cursor = 0;
+  const total = batch.messages.length;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= total) break;
+      await processFile(batch.messages[i], env);
+    }
+  };
+  await Promise.allSettled(Array.from({ length: pool }, () => worker()));
 }
 
 // ─── DLQ 自动重驱动消费者 ────────────────────────────────────────────────────
