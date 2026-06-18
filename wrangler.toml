@@ -31,15 +31,16 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# parse-queue：max_batch_size=3 + handleParseQueue 整批全并行（稳定版 2f1a6d3 方式，asia-vcode-od 验证 3 周稳定）。
-#   ⚠️ 仅适合【大文件小行】域名(如 asia-vcode-od)；【大行域名(如 id-upload ~4KB/行)】全并行 batch=3
-#      会内存叠加触发 128MB OOM —— 那类域名勿部署此版。
-#   max_concurrency 不设：由 autoscaler 自由扩(上限 250)，保证大流量域名吞吐(=2f1a6d3 行为)。
+# parse-queue：handleParseQueue 有界并发池（单 invocation 内最多 [vars].PARSE_PARALLELISM 个文件并行解析）。
+#   2026-06-18 实测（asia-vcode-od 同 ~95K backlog、并发同顶 250）：有界池 batch=2/P=2 ~260 对象/min 在排空、零 OOM；
+#   而整批全并行 batch=3 仅 ~150/min 且部署瞬间偶发 128MB OOM。故改用有界池 → 吞吐更高、全域(含大行 id-upload)可安全部署。
+#   max_batch_size 须 ≥ PARSE_PARALLELISM 才喂满池(=1 退化串行)；且 max_batch_size×单文件CPU 须 < limits.cpu_ms(300s)。
+#   max_concurrency 不设：由 autoscaler 按 backlog 自由扩(上限 250)，保证大流量域名吞吐。
 [[queues.consumers]]
 queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
-max_batch_size     = 3
-max_batch_timeout  = 10
-max_retries        = 2
+max_batch_size     = 2               # 须 ≥ PARSE_PARALLELISM；2026-06 实测 2 比 3 周转更快、零 OOM
+max_batch_timeout  = 5
+max_retries        = 5               # 耗尽后进 parse-dlq，再由 handleDlqRedrive 自动延迟回灌（不丢）
 dead_letter_queue  = "parse-dlq"
 
 # send-queue：max_concurrency 不设(=2f1a6d3 行为，autoscaler 自由扩，保证 od 大 send 量吞吐)。
@@ -101,6 +102,7 @@ LOG_LEVEL        = "info"
 PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
+PARSE_PARALLELISM = "2"              # parse 单 invocation 内并行【解析】文件数（有界池；须 ≤ parse max_batch_size；上限 8；1=串行）
 SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)，默认 30s
 RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)

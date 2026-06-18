@@ -36,13 +36,16 @@
  *    - DLQ 自动重驱动：worker 同时消费 parse-dlq / send-dlq，把死信消息以
  *      指数退避+抖动的延迟回灌到各自源队列，全自动恢复，无需人工/告警。
  *      依赖确定性 batchKey + .done 标记保证重驱动不产生重复（适配无去重接收端）。
+ *    - 源级 .done 幂等早退 + parse 有界并发池：同一原始对象被重复投递（含旧 reconcile 重灌）时，
+ *      靠一次 HEAD 秒级跳过、不重解析；解析吞吐由 PARSE_PARALLELISM 有界池提升，零 OOM、全域可部署。
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
  *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME, PUSH_START_TIME,
- *                FIELD11_SERVER_IP, SEND_PARALLELISM, SEND_FETCH_TIMEOUT_MS,
- *                RETRY_DELAY_SECONDS, REDRIVE_BASE_DELAY_SECONDS,
- *                REDRIVE_MAX_DELAY_SECONDS, REDRIVE_JITTER_SECONDS
+ *                FIELD11_SERVER_IP, SEND_PARALLELISM, PARSE_PARALLELISM,
+ *                SEND_FETCH_TIMEOUT_MS, RETRY_DELAY_SECONDS,
+ *                REDRIVE_BASE_DELAY_SECONDS, REDRIVE_MAX_DELAY_SECONDS,
+ *                REDRIVE_JITTER_SECONDS
  */
 'use strict';
 // ─── IATA机场三字码 → 国家两字码（CDN节点所在国家，用于#45 country字段）─────────
@@ -192,12 +195,32 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  // 整批全并行解析（稳定版 2f1a6d3 的方式，asia-vcode-od 已实测稳定 3 周、扛住 ~100 对象/min）：
-  // 一个 invocation 内并行处理 batch 内全部文件，单 invocation 吞吐随 max_batch_size 提升。
-  // ⚠️ 仅适合【大文件小行】域名(如 asia-vcode-od：单行小、单文件解析峰值内存小，batch=3 全并行不 OOM)；
-  //    【大行域名(如 id-upload ~4KB/行)】全并行会内存叠加触发 128MB OOM —— 那类域名勿用此版。
+  // 有界并发池：单次 invocation 内最多 PARSE_PARALLELISM 个文件并行解析（默认 1=串行；[vars] 设 2）。
+  // 为何是有界池而非「整批全并行」（2026-06-18 实测对比 asia-vcode-od，同一 ~95K backlog、并发同样顶 250）：
+  //   - 整批全并行 batch=3：单 invocation 同时持有 3 个文件的解析态、更重更长 → 完成的 invocation 反而更少，
+  //     实测有效处理仅 ~150 对象/min，且部署瞬间偶发 128MB OOM（大行域名更严重）。
+  //   - 有界池 batch=2 / P=2：单 invocation 更轻、周转更快，实测 ~260 对象/min 在排空、零 OOM → 全域可安全部署。
+  // 内存安全：同一时刻最多 P 个文件在解析，每个仍是流式 + 每 BATCH_SIZE 行 flush →
+  //   峰值内存 ≈ P × 单文件批次(~数 MB)，与对象大小无关，远低于 128MB（大行域名 id-upload 同样安全）。
+  // CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件CPU，须 < limits.cpu_ms(300s)，故 max_batch_size 不宜过大。
+  // 横向扩：invocation 数量仍由 autoscaler 按 backlog 扩（每队列上限 250）。
+  // ⚠️ 需 wrangler 的 parse consumer max_batch_size ≥ PARSE_PARALLELISM，池才有多文件可并行（=1 退化串行）。
   // processFile 内部自行 ack/retry，单文件失败不影响同批其他文件。
-  await Promise.allSettled(batch.messages.map(msg => processFile(msg, env)));
+  const pool = (() => {
+    const n = Number(env?.PARSE_PARALLELISM);
+    if (!Number.isFinite(n) || n < 1) return 1;
+    return Math.min(Math.floor(n), 8); // 软上限，防误填过大导致 OOM
+  })();
+  let cursor = 0;
+  const total = batch.messages.length;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= total) break;
+      await processFile(batch.messages[i], env);
+    }
+  };
+  await Promise.allSettled(Array.from({ length: pool }, () => worker()));
 }
 
 // ─── DLQ 自动重驱动消费者 ────────────────────────────────────────────────────
@@ -262,6 +285,20 @@ async function processFile(msg, env) {
     return;
   }
 
+  // ─── 源级 .done 幂等早退 ───────────────────────────────────────────────────
+  // 该原始对象已被完整处理过（写过源级 .done 标记）→ 一次 HEAD 命中即 ack 跳过，不重解析。
+  // 关键收益：当前 backlog 里同一对象被旧 reconcile 重灌了几十次；第 1 份完成后写下 .done，
+  //   其余重复份在此秒级跳过 → backlog 快速塌缩、又不丢真实未处理对象（首份仍会完整解析投递）。
+  // 标记键 `${key}.done` 落在 logs/ 下但以 .done 结尾（非 .log.gz），不会被当作原始日志再次触发/解析。
+  // 安全边界：源级 .done 仅在【所有批次都已成功入 send-queue】之后才写（见下方）；
+  //   即便 .done 误失/漏写，批次级 .done 仍是「不重复发送」的最终保证。
+  const sourceDoneKey = `${key}.done`;
+  if (await env.RAW_BUCKET.head(sourceDoneKey).catch(() => null)) {
+    log(env, 'info', `Source already processed (skip): ${key}`);
+    msg.ack();
+    return;
+  }
+
   // ─── PUSH_START_TIME 文件级过滤 ───────────────────────────────────────────
   // 环境变量未设置或为空时，跳过过滤，正常处理所有文件（默认行为）
   // 设置后，根据文件名中的时间戳对整个文件做预判断，避免不必要的 R2 读取
@@ -311,6 +348,10 @@ async function processFile(msg, env) {
     });
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
+    // 源级完成标记：仅在【所有批次都已成功入 send-queue】之后才写（投递由持久化的 send-queue + 批次级 .done 保证）。
+    // 写在 msg.ack() 之前；若崩在中途则不会写 .done → 重试/重投会重解析，已发批次撞批次级 .done 跳过、
+    //   未发尾部补发 → 绝不丢日志、也不重复。writeDoneMarker 失败仅告警不抛：丢的只是「下次重复投递的快速跳过」优化。
+    await writeDoneMarker(env, key);
     log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount} skipped=${skipped}`);
     msg.ack();
   } catch (err) {
