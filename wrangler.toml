@@ -31,9 +31,10 @@ binding = "SEND_QUEUE"
 queue   = "send-queue"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# parse-queue：handleParseQueue 有界并发池（单 invocation 内最多 [vars].PARSE_PARALLELISM 个文件并行解析）。
-#   2026-06-18 实测（asia-vcode-od 同 ~95K backlog、并发同顶 250）：有界池 batch=2/P=2 ~260 对象/min 在排空、零 OOM；
-#   而整批全并行 batch=3 仅 ~150/min 且部署瞬间偶发 128MB OOM。故改用有界池 → 吞吐更高、全域(含大行 id-upload)可安全部署。
+# parse-queue：有界并发池(PARSE_PARALLELISM) + processFile 单次 R2 read 空闲超时(PARSE_READ_IDLE_TIMEOUT_MS) 配合。
+#   2026-06-18 实测(asia-vcode-od 同 ~95K backlog、并发同顶 250)：efac854 全并行 batch=3 仅 ~119/min——并发虽顶满，
+#   但大量 invocation 卡在挂死的 R2 read(avg wall 133s、p99 12.5min、甚至撞 15min 上限被杀)空耗并发槽。
+#   加【单次 read 空闲超时(45s 中断卡死读→重试该文件→释放槽)】+ 有界池(更轻/零 OOM) 后实测 ~260/min → 净排空。
 #   max_batch_size 须 ≥ PARSE_PARALLELISM 才喂满池(=1 退化串行)；且 max_batch_size×单文件CPU 须 < limits.cpu_ms(300s)。
 #   max_concurrency 不设：由 autoscaler 按 backlog 自由扩(上限 250)，保证大流量域名吞吐。
 [[queues.consumers]]
@@ -103,6 +104,7 @@ PUSH_START_TIME  = ""
 FIELD11_SERVER_IP = ""
 SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
 PARSE_PARALLELISM = "2"              # parse 单 invocation 内并行【解析】文件数（有界池；须 ≤ parse max_batch_size；上限 8；1=串行）
+PARSE_READ_IDLE_TIMEOUT_MS = "45000" # 单次 R2 read() 空闲超时(ms)；卡死才触发(与对象大小无关)，超时只重试该文件、释放并发槽。0=不限
 SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)，默认 30s
 RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)

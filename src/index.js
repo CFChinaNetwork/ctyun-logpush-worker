@@ -38,12 +38,15 @@
  *      依赖确定性 batchKey + .done 标记保证重驱动不产生重复（适配无去重接收端）。
  *    - 源级 .done 幂等早退 + parse 有界并发池：同一原始对象被重复投递（含旧 reconcile 重灌）时，
  *      靠一次 HEAD 秒级跳过、不重解析；解析吞吐由 PARSE_PARALLELISM 有界池提升，零 OOM、全域可部署。
+ *    - parse 单次 R2 read() 空闲超时(PARSE_READ_IDLE_TIMEOUT_MS，默认45s)：卡死的 R2 流(实测 900~1922s
+ *      I/O 挂死，会占满 250 并发槽把吞吐拖到 ~119/min)在 45s 后中断并重试【该文件】→ 释放 invocation 槽、
+ *      吞吐恢复(实测 ~260/min)。每次 read 重新计时、与对象大小无关，不会误杀大文件；不丢数据(只重试该文件)。
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
  *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME, PUSH_START_TIME,
  *                FIELD11_SERVER_IP, SEND_PARALLELISM, PARSE_PARALLELISM,
- *                SEND_FETCH_TIMEOUT_MS, RETRY_DELAY_SECONDS,
+ *                PARSE_READ_IDLE_TIMEOUT_MS, SEND_FETCH_TIMEOUT_MS, RETRY_DELAY_SECONDS,
  *                REDRIVE_BASE_DELAY_SECONDS, REDRIVE_MAX_DELAY_SECONDS,
  *                REDRIVE_JITTER_SECONDS
  */
@@ -177,6 +180,7 @@ const RAW_LOG_SUFFIX = '.log.gz';
 const DEFAULT_BATCH_SIZE = 1000;
 const MAX_BATCH_SIZE = 2000;
 const MAX_RECOVERY_DAYS = 62;
+const DEFAULT_PARSE_READ_IDLE_MS = 45000;  // 单次 R2 read() 空闲超时默认(ms)：卡死才触发，与对象大小无关
 const LOG_LEVELS   = Object.freeze({ debug:0, info:1, warn:2, error:3 });
 // ─── 主入口 ────────────────────────────────────────────────────────────────
 export default {
@@ -199,7 +203,11 @@ async function handleParseQueue(batch, env) {
   // 为何是有界池而非「整批全并行」（2026-06-18 实测对比 asia-vcode-od，同一 ~95K backlog、并发同样顶 250）：
   //   - 整批全并行 batch=3：单 invocation 同时持有 3 个文件的解析态、更重更长 → 完成的 invocation 反而更少，
   //     实测有效处理仅 ~150 对象/min，且部署瞬间偶发 128MB OOM（大行域名更严重）。
-  //   - 有界池 batch=2 / P=2：单 invocation 更轻、周转更快，实测 ~260 对象/min 在排空、零 OOM → 全域可安全部署。
+  //   - 有界池 batch=2 / P=2：单 invocation 更轻、周转更快、零 OOM → 全域可安全部署。
+  // ⚠️ 但吞吐能否真正排空，关键还在 processFile 里的【单次 R2 read 空闲超时】：2026-06-18 实测 efac854 在
+  //    并发已顶满 250 的情况下仍只有 ~119/min——因为大量 invocation 卡在挂死的 R2 read 上(avg wall 133s、
+  //    p99 12.5min、甚至撞 15min 上限被杀)，并发槽被空耗。空闲超时(45s)中断卡死读、释放槽后实测 ~260/min。
+  //    故「有界池(轻/零OOM) + 单次read空闲超时(释放卡死槽)」两者配合，才把 ~119→~260/min、净排空 backlog。
   // 内存安全：同一时刻最多 P 个文件在解析，每个仍是流式 + 每 BATCH_SIZE 行 flush →
   //   峰值内存 ≈ P × 单文件批次(~数 MB)，与对象大小无关，远低于 128MB（大行域名 id-upload 同样安全）。
   // CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件CPU，须 < limits.cpu_ms(300s)，故 max_batch_size 不宜过大。
@@ -320,6 +328,10 @@ async function processFile(msg, env) {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
+    // 单次 R2 read() 空闲超时：健康流每几百 ms 出块、永不触发；只有【单次读卡死】(实测见过 900~1922s I/O 挂死，
+    // 会占满 250 并发槽、把吞吐拖到 ~119/min)才超时 → 抛错 → 下方 catch 对【这一个文件】msg.retry
+    // (只重试该文件、不挡同批后续、不丢数据；释放 invocation 槽 → 吞吐恢复)。阈值与对象大小无关 → 全域统一。
+    const idleTimeoutMs = parseIntegerVar(env, 'PARSE_READ_IDLE_TIMEOUT_MS', DEFAULT_PARSE_READ_IDLE_MS, 0, 600000);
     let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0, skipped = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
@@ -345,7 +357,7 @@ async function processFile(msg, env) {
     }, (line) => {
       parseErrCount++;
       if (parseErrCount <= 5) log(env, 'warn', `JSON parse failed in ${key}: ${line.substring(0, 100)}`);
-    });
+    }, idleTimeoutMs);
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
     // 源级完成标记：仅在【所有批次都已成功入 send-queue】之后才写（投递由持久化的 send-queue + 批次级 .done 保证）。
@@ -483,13 +495,32 @@ async function sendBatchUnlocked(key, env) {
   log(env, 'debug', `Deleted: ${key}`);
 }
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
-async function streamParseNdjsonGzip(inputStream, onRecord, onParseError) {
+async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, idleTimeoutMs = 0) {
   const reader  = inputStream.pipeThrough(new DecompressionStream('gzip')).getReader();
   const decoder = new TextDecoder('utf-8');
   let   buffer  = '';
+  // idleTimeoutMs>0：给【每一次 reader.read()】设空闲超时（不是整文件总时限）。
+  // 健康的 R2 流每几百毫秒就产出一块数据，永远不会触发；只有「单次读卡死」（连接挂住，
+  // 实测纯 I/O 等待 900~1922s）才会触发 → 抛错 → 上层对该文件 msg.retry。
+  // 关键：阈值与对象大小【无关】（大文件也是连续出块），可全域统一一个值、不会误杀大文件。
+  // 每次循环重新计时（空闲口径）。0=不限（旧默认行为）。
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      let res;
+      if (idleTimeoutMs > 0) {
+        const rp = reader.read();
+        rp.catch(() => {});   // 若超时赢得 race，吞掉 read() 的滞后 rejection，避免 unhandled rejection
+        let timer;
+        try {
+          res = await Promise.race([
+            rp,
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Parse read idle timeout after ${idleTimeoutMs}ms`)), idleTimeoutMs); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      } else {
+        res = await reader.read();
+      }
+      const { done, value } = res;
       if (done) {
         const last = buffer.trim();
         if (last) await tryParse(last, onRecord, onParseError);
@@ -503,7 +534,10 @@ async function streamParseNdjsonGzip(inputStream, onRecord, onParseError) {
         if (t) await tryParse(t, onRecord, onParseError);
       }
     }
-  } finally { reader.releaseLock(); }
+  } finally {
+    // cancel() 释放锁并（超时时）中断底层 R2 流；正常读完时为无害 no-op。不 await，避免 finally 卡住。
+    reader.cancel().catch(() => {});
+  }
 }
 async function tryParse(line, onRecord, onParseError) {
   try { await onRecord(JSON.parse(line)); }
