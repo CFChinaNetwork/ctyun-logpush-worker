@@ -27,6 +27,8 @@
  *    防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
  *
  *  关键机制：
+ *    - PUSH_START_TIME 时间过滤（未来/过去双模式）
+ *    - Scheduled handler 自动补传（一次性 + 幂等 marker）
  *    - send-queue 同 batch 内串行 + .done 标记保证 at-least-once 幂等
  *    - Queue send 失败回滚 R2 临时文件
  *    - resp.body.cancel() 防 stalled HTTP response
@@ -37,7 +39,7 @@
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
- *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME,
+ *                PARSE_DLQ_NAME, SEND_DLQ_NAME, R2_BUCKET_NAME, PUSH_START_TIME,
  *                FIELD11_SERVER_IP, SEND_PARALLELISM, SEND_FETCH_TIMEOUT_MS,
  *                RETRY_DELAY_SECONDS, REDRIVE_BASE_DELAY_SECONDS,
  *                REDRIVE_MAX_DELAY_SECONDS, REDRIVE_JITTER_SECONDS
@@ -171,18 +173,9 @@ const RAW_LOG_PREFIX = 'logs/';
 const RAW_LOG_SUFFIX = '.log.gz';
 const DEFAULT_BATCH_SIZE = 1000;
 const MAX_BATCH_SIZE = 2000;
-// 单次 R2 流式读的【空闲超时】默认值（ms）。健康读每几百毫秒出块，永不触发；只有读卡死才触发。
-// 与对象大小无关 → 全域统一一个值即可，不需要按域名调。0=不限。
-const DEFAULT_PARSE_READ_IDLE_MS = 45000;
-// 补扫（reconciliation）默认参数：只兜底「事件通知漏/晚」的对象，正常路径仍是实时事件驱动。
-const RECONCILE_DEFAULT_LOOKBACK_MIN = 120; // 回看窗口（分钟）：只考虑最近这段时间落桶的对象
-const RECONCILE_DEFAULT_GRACE_SEC    = 120; // 宽限（秒）：落桶不足此时长的对象先交给事件路径，避免与之竞争
-const RECONCILE_DEFAULT_MAX_ENQUEUE  = 500; // 单次补扫最多回灌对象数（防一次性回灌过多）
+const MAX_RECOVERY_DAYS = 62;
 const LOG_LEVELS   = Object.freeze({ debug:0, info:1, warn:2, error:3 });
 // ─── 主入口 ────────────────────────────────────────────────────────────────
-// 实时性主路径：R2 Event Notification（对新建对象触发）→ queue 消费者，~2min 端到端。
-// 兜底安全网：cron 每分钟触发 scheduled() 补扫，捕捉「事件通知漏/晚」的对象（R2 通知 best-effort，
-//   实测见过晚 53min）。两者经同一套 .done 幂等去重，互不产生重复发送。
 export default {
   async queue(batch, env, ctx) {
     if      (batch.queue === env.PARSE_QUEUE_NAME) await handleParseQueue(batch, env);
@@ -192,47 +185,19 @@ export default {
     else if (env.SEND_DLQ_NAME  && batch.queue === env.SEND_DLQ_NAME)  await handleDlqRedrive(batch, env, env.SEND_QUEUE,  env.SEND_QUEUE_NAME,  'send');
     else throw new Error(`Unknown queue: ${batch.queue}; check PARSE_QUEUE_NAME/SEND_QUEUE_NAME/PARSE_DLQ_NAME/SEND_DLQ_NAME`);
   },
-  // Cron（每分钟）触发的【补扫 / reconciliation】——纯事件驱动的兜底安全网。
-  // 背景：R2 Event Notification 是 best-effort，瞬时投递失败时由 R2 内部 CronJob 重试，
-  //   可能延迟数十分钟（实测见过 53min）才把消息投到 parse-queue → 对象早已落 R2 却长时间无人处理
-  //   = 客户侧 gap。事件路径无法自愈这一类（worker 根本没被触发）。
-  // 补扫做法：扫描最近窗口内「已落桶超过 grace、却没有源级 .done 标记」的原始对象，回灌 parse-queue。
-  // 幂等：源级 .done 早退 + 批次级 .done 保证回灌不会重复发送（见 processFile / writeBatchAndEnqueue）。
-  // 安全：handleReconcile 内部全程 try/catch，永不抛出 → 不会出现 scriptThrewException；
-  //   ctx.waitUntil 让补扫在响应返回后继续完成。
-  async scheduled(controller, env, ctx) {
-    ctx.waitUntil(handleReconcile(env));
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(handleScheduled(env));
   },
 };
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
-  // 有界并发池：在单次 invocation 内【并行】解析 batch 内多个文件，提升解析吞吐（治本修复）。
-  // 背景（2026-06 实测）：纯串行(一次一个文件)在最大域名(asia-vcode-od ~97 对象/min、单文件数万行)
-  //   真实完成率仅 ~77/min < ingest ~97/min → 持续积压、客户少收 ~20%。根因是串行单 invocation 吞吐太低，
-  //   autoscaler 横向扩也补不齐。改为有界并发池后单 invocation 吞吐 ×P，配合横向扩追上 ingest。
-  // 内存安全（不重蹈旧版「整 batch 全并行无界」的 OOM）：并发上限 = PARSE_PARALLELISM（默认 1=串行；
-  //   wrangler 设 2）。同一时刻最多 P 个文件在解析，每个文件仍是流式 + 每 BATCH_SIZE 行 flush →
-  //   峰值内存 ≈ P × 单文件(数十 MB)，与对象大小无关，远低于旧版。
-  //   ⚠️ 需 wrangler 的 parse consumer max_batch_size ≥ P，池才有多文件可并行（=1 则退化为串行）。
-  // CPU 安全：单次 invocation 总 CPU ≈ max_batch_size × 单文件CPU，须 < limits.cpu_ms(300s)；故 max_batch_size 不宜过大。
-  // 吞吐横向扩：invocation 数量仍由 autoscaler 按 backlog 扩（每队列上限 250）。
-  // processFile 内部自 ack/retry，单文件失败不影响同批其他文件。
-  const pool = (() => {
-    const n = Number(env?.PARSE_PARALLELISM);
-    if (!Number.isFinite(n) || n < 1) return 1;
-    return Math.min(Math.floor(n), 8); // 软上限，防误填过大导致 OOM
-  })();
-  let cursor = 0;
-  const total = batch.messages.length;
-  const worker = async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= total) break;
-      await processFile(batch.messages[i], env);
-    }
-  };
-  await Promise.allSettled(Array.from({ length: pool }, () => worker()));
+  // 整批全并行解析（稳定版 2f1a6d3 的方式，asia-vcode-od 已实测稳定 3 周、扛住 ~100 对象/min）：
+  // 一个 invocation 内并行处理 batch 内全部文件，单 invocation 吞吐随 max_batch_size 提升。
+  // ⚠️ 仅适合【大文件小行】域名(如 asia-vcode-od：单行小、单文件解析峰值内存小，batch=3 全并行不 OOM)；
+  //    【大行域名(如 id-upload ~4KB/行)】全并行会内存叠加触发 128MB OOM —— 那类域名勿用此版。
+  // processFile 内部自行 ack/retry，单文件失败不影响同批其他文件。
+  await Promise.allSettled(batch.messages.map(msg => processFile(msg, env)));
 }
 
 // ─── DLQ 自动重驱动消费者 ────────────────────────────────────────────────────
@@ -283,99 +248,6 @@ async function handleDlqRedrive(batch, env, targetQueue, targetName, label) {
 function retryDelaySeconds(env) {
   return parseIntegerVar(env, 'RETRY_DELAY_SECONDS', 30, 0, 43200);
 }
-
-// ─── 补扫 / reconciliation（cron 每分钟触发）────────────────────────────────────
-// 列出最近窗口内的原始对象与源级 .done 标记，挑出「落桶超过 grace 却没有 .done」的对象，回灌 parse-queue。
-// 全程 try/catch，永不抛出（避免 scheduled scriptThrewException）。
-async function handleReconcile(env) {
-  try {
-    if (!env.PARSE_QUEUE) { log(env, 'error', '[RECONCILE] PARSE_QUEUE binding missing; skip'); return; }
-    const lookbackMs = parseIntegerVar(env, 'RECONCILE_LOOKBACK_MINUTES', RECONCILE_DEFAULT_LOOKBACK_MIN, 1, 1440) * 60000;
-    const graceMs    = parseIntegerVar(env, 'RECONCILE_GRACE_SECONDS',   RECONCILE_DEFAULT_GRACE_SEC,    30, 3600) * 1000;
-    const maxEnqueue = parseIntegerVar(env, 'RECONCILE_MAX_ENQUEUE',     RECONCILE_DEFAULT_MAX_ENQUEUE,  1, 10000);
-    const now = Date.now();
-    const rawSuffix  = env?.RAW_LOG_SUFFIX || RAW_LOG_SUFFIX;
-    const doneSuffix = `${rawSuffix}.done`;
-    const prefixes = genDayPrefixes(now - lookbackMs, now, env);
-
-    const rawUploaded = new Map(); // rawKey -> uploadedMs
-    const doneSet     = new Set(); // rawKey（去掉 .done 后缀）
-    for (const prefix of prefixes) {
-      let cursor;
-      do {
-        const page = await env.RAW_BUCKET.list({ prefix, limit: 1000, cursor });
-        for (const o of (page.objects || [])) {
-          const k = o.key;
-          const up = o.uploaded ? new Date(o.uploaded).getTime() : 0;
-          if (k.endsWith(doneSuffix)) {
-            doneSet.add(k.slice(0, -('.done'.length))); // 源级完成标记
-          } else if (isRawLogKey(k, env)) {
-            rawUploaded.set(k, up);                       // 原始 Logpush 对象
-          }
-          // 其余（processed/、running marker 等）忽略
-        }
-        cursor = page.truncated ? page.cursor : undefined;
-      } while (cursor);
-    }
-
-    const candidates = selectReconcileCandidates(rawUploaded, doneSet, now, lookbackMs, graceMs, maxEnqueue);
-    if (candidates.length === 0) { log(env, 'debug', '[RECONCILE] no stale objects'); return; }
-    log(env, 'warn', `[RECONCILE] re-enqueueing ${candidates.length} stale object(s) (lookback=${lookbackMs / 60000}min grace=${graceMs / 1000}s, scanned=${rawUploaded.size})`);
-
-    const bucketName = env.R2_BUCKET_NAME || 'cdn-logs-raw';
-    for (let i = 0; i < candidates.length; i += 100) { // Queue sendBatch 上限 100
-      const batch = candidates.slice(i, i + 100).map((key) => ({
-        body: { bucket: bucketName, object: { key }, __reconcile: true },
-      }));
-      try {
-        await env.PARSE_QUEUE.sendBatch(batch);
-      } catch (e) {
-        log(env, 'warn', `[RECONCILE] enqueue batch failed (${batch.length} msgs): ${e.message || e}`);
-      }
-    }
-  } catch (e) {
-    // 补扫失败必须非致命：退回纯事件驱动（gap 可能回来但不新增丢失），下一次 cron 再试。
-    log(env, 'error', `[RECONCILE] non-fatal error: ${e?.message || e}`);
-  }
-}
-
-// 纯函数（便于单测）：从「原始对象 uploaded 时间表 + 已完成集合」挑出需要回灌的对象。
-//   - 跳过已有源级 .done 的（已处理）
-//   - 跳过落桶不足 grace 的（太新，先让事件路径处理，避免竞争重复）
-//   - 跳过落桶早于 lookback 的（窗口外，避免无限重试坏对象）
-//   - uploaded 缺失(=0) 的对象视为需要处理（保守：宁可重投也不漏）
-function selectReconcileCandidates(rawUploaded, doneSet, now, lookbackMs, graceMs, maxEnqueue) {
-  const out = [];
-  const freshAfter = now - graceMs;   // uploaded 晚于此 = 太新
-  const windowStart = now - lookbackMs; // uploaded 早于此 = 窗口外
-  for (const [key, up] of rawUploaded) {
-    if (doneSet.has(key)) continue;
-    if (up && up > freshAfter) continue;
-    if (up && up < windowStart) continue;
-    out.push(key);
-    if (out.length >= maxEnqueue) break;
-  }
-  return out;
-}
-
-// 生成补扫所需的按 UTC 日期 prefix 列表（logs/YYYYMMDD/）。lookback ≤ 24h，故最多跨 2~3 个 UTC 日。
-function genDayPrefixes(startMs, endMs, env) {
-  const base = env?.RAW_LOG_PREFIX || RAW_LOG_PREFIX;
-  const prefixBase = base.endsWith('/') ? base : `${base}/`;
-  const prefixes = [];
-  const d = new Date(startMs); d.setUTCHours(0, 0, 0, 0);
-  const end = new Date(endMs); end.setUTCHours(0, 0, 0, 0);
-  let iter = 0;
-  while (d.getTime() <= end.getTime() && iter++ < 3) {
-    const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    prefixes.push(`${prefixBase}${yyyy}${mm}${dd}/`);
-    d.setUTCDate(d.getUTCDate() + 1);
-  }
-  return prefixes;
-}
-
 async function processFile(msg, env) {
   const key = msg.body?.object?.key;
   if (!key) {
@@ -390,29 +262,38 @@ async function processFile(msg, env) {
     return;
   }
 
-  // 源级幂等早退：若该原始对象已被完整处理过（写过源级 .done 标记），直接跳过。
-  // 应对「补扫回灌」与「迟到数十分钟的事件通知」对同一对象的重复投递 —— 避免无谓重解析，
-  // 并把潜在并发重发窗口压到最小（批次级 .done 仍是不重发的最终保证）。
-  const sourceDoneKey = `${key}.done`;
-  if (await env.RAW_BUCKET.head(sourceDoneKey).catch(() => null)) {
-    log(env, 'info', `Source already processed (skip): ${key}`);
-    msg.ack();
-    return;
+  // ─── PUSH_START_TIME 文件级过滤 ───────────────────────────────────────────
+  // 环境变量未设置或为空时，跳过过滤，正常处理所有文件（默认行为）
+  // 设置后，根据文件名中的时间戳对整个文件做预判断，避免不必要的 R2 读取
+  // 文件名格式: logs/YYYYMMDD/YYYYMMDDTHHmmssZ_YYYYMMDDTHHmmssZ_xxxx.log.gz
+  // 一次性逻辑：当所有新文件时间都 >= startMs 时，此过滤永远不触发，无性能损耗
+  const startMs = getPushStartMs(env);
+  if (startMs !== null) {
+    const fileEndMs = parseFileEndTime(key);
+    if (fileEndMs !== null && fileEndMs < startMs) {
+      log(env, 'info', `Skipped (before PUSH_START_TIME): ${key}`);
+      msg.ack();
+      return;
+    }
   }
+  // ─────────────────────────────────────────────────────────────────────────
 
   log(env, 'info', `Parsing: ${key}`);
   try {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
-    // PARSE_READ_IDLE_TIMEOUT_MS：给【每一次 R2 read()】设空闲超时（非整文件总时限）。健康读每几百毫秒
-    // 出块，永不触发；只有单次读卡死（连接挂住，实测纯 I/O 等待 900~1922s）才触发 → 抛错 → 下方 catch 对
-    // 【这一个文件】msg.retry（只重试该文件、不挡同批后续、不丢数据）。阈值与对象大小无关 → 全域统一一个值、
-    // 不会误杀大文件。默认 45000ms；0=不限。卡住文件不再堵住队列（06-12 那种级联的根因修复）。
-    const idleTimeoutMs = parseIntegerVar(env, 'PARSE_READ_IDLE_TIMEOUT_MS', DEFAULT_PARSE_READ_IDLE_MS, 0, 600000);
-    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0;
+    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0, skipped = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
+      // 逐行时间过滤：仅用于文件跨越 startMs 的边界情况
+      if (startMs !== null) {
+        const recMs = parseTimestamp(record.EdgeStartTimestamp);
+        if (recMs !== null && recMs < startMs) {
+          skipped++;
+          return;
+        }
+      }
       try {
         lines.push(transformEdge(record, env));
       } catch (e) {
@@ -427,13 +308,10 @@ async function processFile(msg, env) {
     }, (line) => {
       parseErrCount++;
       if (parseErrCount <= 5) log(env, 'warn', `JSON parse failed in ${key}: ${line.substring(0, 100)}`);
-    }, idleTimeoutMs);
+    });
     if (lineCount === 0 && parseErrCount > 0) throw new Error(`No valid JSON records in ${key}; parseErrors=${parseErrCount}`);
     if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
-    // 写源级完成标记（供补扫判定「已处理」+ 重复投递早退）。复用 writeDoneMarker：写 `${key}.done`。
-    // 失败仅告警不抛（批次级 .done 仍保证不重发；下次补扫会再处理一次，靠 .done 去重）。
-    await writeDoneMarker(env, key);
-    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount}`);
+    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} parseErrors=${parseErrCount} skipped=${skipped}`);
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
@@ -533,9 +411,11 @@ async function sendBatchUnlocked(key, env) {
   //   说明接收端不支持 chunked 请求体，需协调客户端启用。
   const compressedStream = object.body.pipeThrough(new CompressionStream('gzip'));
 
-  // 单次发送 fetch 超时（默认 120s，可配 1000–120000ms）：仅用于 abort 完全 hang 的接收端 → 外层 catch
-  // → msg.retry()。实测 invocation P999≈82s，远低于 15min wall 上限，120s 安全且给慢接收端留足余量。
-  const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 120000, 1000, 120000);
+  // 单次 fetch 超时（默认 30s，可配）：客户端 hang 时尽快 abort → 外层 catch → msg.retry() 接管。
+  // 作用有二：①缩短「慢发送滞留」时间，降低同一 isolate 内并发发送的内存堆积（OOM 触发链）；
+  //          ②保证最坏情况下单 invocation wall = (max_batch_size / SEND_PARALLELISM) × 超时 仍 < 15min 上限。
+  // 默认从历史的 60s 收紧到 30s（接收端慢时 durationP99 曾逼近 60s）。Enterprise 接收端正常应远快于此。
+  const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 30000, 1000, 60000);
   const fetchInit = {
     method: 'POST',
     headers: {
@@ -562,32 +442,13 @@ async function sendBatchUnlocked(key, env) {
   log(env, 'debug', `Deleted: ${key}`);
 }
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
-async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, idleTimeoutMs = 0) {
+async function streamParseNdjsonGzip(inputStream, onRecord, onParseError) {
   const reader  = inputStream.pipeThrough(new DecompressionStream('gzip')).getReader();
   const decoder = new TextDecoder('utf-8');
   let   buffer  = '';
-  // idleTimeoutMs>0：给【每一次 reader.read()】设空闲超时（不是整文件总时限）。
-  // 健康的 R2 流每几百毫秒就产出一块数据，永远不会触发；只有「单次读卡死」（连接挂住，
-  // 实测纯 I/O 等待 900~1922s）才会触发 → 抛错 → 上层对该文件 msg.retry。
-  // 关键：阈值与对象大小【无关】（大文件也是连续出块），可全域统一一个值、不会误杀大文件。
-  // 每次循环重新计时（空闲口径），区别于旧版「整文件总时限」需按域名调。0=不限（旧默认行为）。
   try {
     while (true) {
-      let res;
-      if (idleTimeoutMs > 0) {
-        const rp = reader.read();
-        rp.catch(() => {});   // 若超时赢得 race，吞掉 read() 的滞后 rejection，避免 unhandled rejection
-        let timer;
-        try {
-          res = await Promise.race([
-            rp,
-            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Parse read idle timeout after ${idleTimeoutMs}ms`)), idleTimeoutMs); }),
-          ]);
-        } finally { clearTimeout(timer); }
-      } else {
-        res = await reader.read();
-      }
-      const { done, value } = res;
+      const { done, value } = await reader.read();
       if (done) {
         const last = buffer.trim();
         if (last) await tryParse(last, onRecord, onParseError);
@@ -601,10 +462,7 @@ async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, idleTi
         if (t) await tryParse(t, onRecord, onParseError);
       }
     }
-  } finally {
-    // cancel() 释放锁并（超时时）中断底层 R2 流；正常读完时为无害 no-op。不 await，避免 finally 卡住。
-    reader.cancel().catch(() => {});
-  }
+  } finally { reader.releaseLock(); }
 }
 async function tryParse(line, onRecord, onParseError) {
   try { await onRecord(JSON.parse(line)); }
@@ -613,9 +471,7 @@ async function tryParse(line, onRecord, onParseError) {
 // ─── 格式转换: CF http_requests → CDN partner log format v3.0（145字段）─────────
 //
 // 字段说明:
-//   #11 server_ip:         FIELD11_SERVER_IP（wrangler 填入该域名的解析/anycast IP，如 172.65.90.64），必填。
-//                          ⚠️不取 EdgeServerIP：按 CF 文档它是「边缘→源站」的内部 IP（仅回源请求才有值、
-//                          cache 命中为空），并非客户 server_ip($server_addr) 语义，会污染该字段。
+//   #11 server_ip:         EdgeServerIP；为空时使用 FIELD11_SERVER_IP 兜底
 //   #6  request_time:      (EdgeEndTimestamp - EdgeStartTimestamp) / 1000
 //   #7  rwt_time:          OriginResponseHeaderReceiveDurationMs / 1000
 //   #8  wwt_time:          OriginRequestHeaderSendDurationMs / 1000
@@ -651,7 +507,7 @@ function transformEdge(r, env) {
     /* 8  */ fmtSec(r.OriginRequestHeaderSendDurationMs),
     /* 9  */ fmtSec(r.EdgeTimeToFirstByteMs),
     /* 10 */ finalizeErrorCode(r),
-    /* 11 */ sf(env.FIELD11_SERVER_IP),
+    /* 11 */ sf(r.EdgeServerIP || env.FIELD11_SERVER_IP),
     /* 12 */ schemeToPort(r.ClientRequestScheme),
     /* 13 */ sf(r.ClientIP),
     /* 14 */ sf(r.ClientSrcPort),
@@ -797,6 +653,223 @@ async function writeDoneMarker(env, key) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─── PUSH_START_TIME 辅助函数 ─────────────────────────────────────────────
+// 解析环境变量 PUSH_START_TIME，返回毫秒时间戳，未设置时返回 null
+// 支持 ISO 8601 格式，如 "2026-04-15T10:00:00Z" 或 "2026-04-15T18:00:00+08:00"
+function getPushStartMs(env) {
+  const v = env.PUSH_START_TIME;
+  if (!v || !v.trim()) return null;
+  const ms = new Date(v.trim()).getTime();
+  if (isNaN(ms)) {
+    console.warn(`[WARN] Invalid PUSH_START_TIME: "${v}", filtering disabled`);
+    return null;
+  }
+  return ms;
+}
+
+// 从 R2 文件名中解析文件结束时间（毫秒）
+// 文件名格式: logs/20260415/20260415T100000Z_20260415T100060Z_xxxx.log.gz
+// 第二个时间戳为文件结束时间，用于文件级快速预判断
+// 解析失败时返回 null，退化为逐行过滤
+function parseFileEndTime(key) {
+  // 匹配文件名中的第二个时间戳（ISO基本格式：YYYYMMDDTHHmmssZ）
+  const m = key.match(/\d{8}T\d{6}Z_(\d{8}T\d{6}Z)/);
+  if (!m) return null;
+  // 转换为 ISO 8601 扩展格式让 Date 可以解析
+  const s = m[1]; // e.g. "20260415T100060Z"
+  const iso = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
+  const ms = new Date(iso).getTime();
+  return isNaN(ms) ? null : ms;
+}
+
+// 从 R2 文件名中解析文件开始时间（毫秒）
+// 第一个时间戳为文件开始时间，用于补救恢复时判断文件是否在目标时间范围内
+function parseFileStartTime(key) {
+  const m = key.match(/(\d{8}T\d{6}Z)_\d{8}T\d{6}Z/);
+  if (!m) return null;
+  const s = m[1];
+  const iso = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
+  const ms = new Date(iso).getTime();
+  return isNaN(ms) ? null : ms;
+}
+
+// ─── Scheduled 处理：Cron 每分钟触发一次，检查是否需要补传历史日志 ─────────
+// 触发补救的条件（全部满足）：
+//   1. PUSH_START_TIME 已设置
+//   2. 其值 < 当前时间（过去时间）
+//   3. 该时间值对应的完成标记 .recover-done-<时间> 在 R2 中不存在
+// 满足条件时：扫描 R2 logs/ 目录 → 筛选时间范围匹配的文件 → 批量入队 parse-queue
+// 执行成功后写入完成标记；失败不写 done，下一次 Cron 自动重试
+const RECOVER_MARKER_PREFIX = '.recover-done-';
+const RECOVER_RUNNING_PREFIX = '.recover-running-';
+const RECOVER_RUNNING_STALE_MS = 15 * 60 * 1000;
+
+async function handleScheduled(env) {
+  const startMs = getPushStartMs(env);
+  if (startMs === null) {
+    // 未设置或格式错误，秒级返回
+    return;
+  }
+  const now = Date.now();
+  if (startMs > now) {
+    // 未来时间，无需恢复
+    return;
+  }
+  const recoveryDays = getRecoveryDayCount(startMs, now);
+  if (recoveryDays > MAX_RECOVERY_DAYS) {
+    log(env, 'error', `[SCHEDULED] Recovery range ${recoveryDays} days exceeds ${MAX_RECOVERY_DAYS}-day safety limit; use dedicated backfill worker`);
+    return;
+  }
+  // 过去时间，检查幂等标记
+  const v = env.PUSH_START_TIME.trim();
+  const encoded = encodeURIComponent(v);
+  const markerKey = `${RECOVER_MARKER_PREFIX}${encoded}`;
+  const runningKey = `${RECOVER_RUNNING_PREFIX}${encoded}`;
+  const existing = await env.RAW_BUCKET.head(markerKey).catch(() => null);
+  if (existing) {
+    // 已执行过，跳过
+    return;
+  }
+
+  const running = await env.RAW_BUCKET.head(runningKey).catch(() => null);
+  const runningUploadedMs = running?.uploaded ? new Date(running.uploaded).getTime() : 0;
+  if (running && runningUploadedMs && now - runningUploadedMs < RECOVER_RUNNING_STALE_MS) {
+    log(env, 'info', `[SCHEDULED] Recovery already running: PUSH_START_TIME=${v}`);
+    return;
+  }
+
+  log(env, 'info', `[SCHEDULED] Recovery started: PUSH_START_TIME=${v}, scanning R2 for files from that time to now`);
+
+  // 先写 running 标记，降低重复 Cron 并发；失败时删除，成功后写 done。
+  try {
+    await env.RAW_BUCKET.put(runningKey, JSON.stringify({
+      pushStartTime: v,
+      startedAt: new Date().toISOString(),
+    }), {
+      httpMetadata: { contentType: 'application/json' },
+    });
+  } catch (e) {
+    log(env, 'error', `[SCHEDULED] Failed to write marker, aborting: ${e.message}`);
+    return;
+  }
+
+  // 执行恢复
+  let result;
+  try {
+    result = await recoverLogs(env, startMs, now);
+    if (result.errors > 0 || result.enqueued !== result.matched) {
+      throw new Error(`Recovery incomplete: ${JSON.stringify(result)}`);
+    }
+  } catch (e) {
+    log(env, 'error', `[SCHEDULED] Recovery failed: ${e.message}`);
+    await env.RAW_BUCKET.delete(runningKey).catch(() => {});
+    return;
+  }
+
+  // 更新标记，记录完成结果
+  try {
+    await env.RAW_BUCKET.put(markerKey, JSON.stringify({
+      pushStartTime: v,
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      result,
+    }), {
+      httpMetadata: { contentType: 'application/json' },
+    });
+  } catch (e) {
+    log(env, 'error', `[SCHEDULED] Recovery done marker write failed; will retry after running marker becomes stale: ${e.message}`);
+    return;
+  }
+  await env.RAW_BUCKET.delete(runningKey).catch(() => {});
+
+  log(env, 'info', `[SCHEDULED] Recovery done: ${JSON.stringify(result)}`);
+}
+
+// 扫描 R2 目录，把时间范围内的文件批量入队到 parse-queue
+// 为避免全桶扫描，按日期拆分 prefix（logs/YYYYMMDD/）
+async function recoverLogs(env, startMs, endMs) {
+  const prefixes = getR2PrefixesByDay(startMs, endMs, env);
+  let scanned = 0;
+  let matched = 0;
+  let enqueued = 0;
+  let errors = 0;
+
+  for (const prefix of prefixes) {
+    let cursor;
+    do {
+      const page = await env.RAW_BUCKET.list({ prefix, limit: 1000, cursor });
+
+      const toEnqueue = [];
+      for (const obj of page.objects) {
+        scanned++;
+        const key = obj.key;
+        // 仅恢复原始 Logpush 文件，避免 processed/ 和 marker 被误处理。
+        if (!isRawLogKey(key, env)) continue;
+
+        const fileStartMs = parseFileStartTime(key);
+        const fileEndMs = parseFileEndTime(key);
+        if (fileStartMs === null || fileEndMs === null) continue;
+
+        // 文件时间 [fileStartMs, fileEndMs] 与目标 [startMs, endMs] 有重叠
+        if (fileStartMs <= endMs && fileEndMs >= startMs) {
+          matched++;
+          // bucket 字段仅为与 R2 Event Notification 原生消息格式保持一致
+          // Parser 实际通过 env.RAW_BUCKET binding 访问，不读 bucket 字段
+          toEnqueue.push({
+            body: { bucket: env.R2_BUCKET_NAME || 'cdn-logs-raw', object: { key } },
+          });
+        }
+      }
+
+      // 批量入队，每批最多 100（Queue sendBatch 限制）
+      for (let i = 0; i < toEnqueue.length; i += 100) {
+        const batch = toEnqueue.slice(i, i + 100);
+        try {
+          await env.PARSE_QUEUE.sendBatch(batch);
+          enqueued += batch.length;
+        } catch (e) {
+          errors += batch.length;
+          log(env, 'warn', `[RECOVER] Batch enqueue failed (${batch.length} msgs): ${e.message}`);
+        }
+      }
+
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
+
+  return { prefixes, scanned, matched, enqueued, errors };
+}
+
+// 根据时间范围生成 R2 list 所需的日期 prefix 列表（避免全桶扫描）
+// 以 UTC 日期为边界（R2 文件名中的时间戳是 UTC）
+function getR2PrefixesByDay(startMs, endMs, env) {
+  const prefixes = [];
+  const rawPrefix = env?.RAW_LOG_PREFIX || RAW_LOG_PREFIX;
+  const prefixBase = rawPrefix.endsWith('/') ? rawPrefix : `${rawPrefix}/`;
+  const d = new Date(startMs);
+  d.setUTCHours(0, 0, 0, 0);
+  const endDay = new Date(endMs);
+  endDay.setUTCHours(0, 0, 0, 0);
+  // 最多遍历 62 天，防止误配置导致过量扫描
+  let iter = 0;
+  while (d.getTime() <= endDay.getTime() && iter++ < 62) {
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    prefixes.push(`${prefixBase}${yyyy}${mm}${dd}/`);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return prefixes;
+}
+
+function getRecoveryDayCount(startMs, endMs) {
+  const start = new Date(startMs);
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(endMs);
+  end.setUTCHours(0, 0, 0, 0);
+  return Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
 }
 
 // #10 finalize_error_code: 该字段为nginx/ATS架构特有的连接中断错误码
