@@ -1,44 +1,29 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# 每个域名部署前【必须修改 / 必填】的项目（PER-DOMAIN CHECKLIST）
-#   <domain> = 该域名标识（如 id-upload-appstore-vivoglobal）。逐项对齐，名字一一对应：
-#   1) name                    = "<domain>-com-log"
-#   2) account_id              = 该域名所在账号 ID（ss_vivo_static / ss_vivo_dynamic）
-#   3) r2_buckets.bucket_name 与 [vars].R2_BUCKET_NAME = "<domain>-com"（两处一致）
-#   4) 队列名（2 个 producers + 4 个 consumers + 4 个 *_QUEUE_NAME/*_DLQ_NAME）统一后缀：
-#        parse-queue-<domain> / send-queue-<domain> / parse-dlq-<domain> / send-dlq-<domain>
-#   5) [vars].FIELD11_SERVER_IP = 该域名解析 / anycast IP（写入第 11 字段 server_ip，【必填】，如 172.65.90.64）
-#   6) 三个 secret（不在本文件）：wrangler secret put CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE
-#   其余 [vars] 均有默认值，一般保持默认即可。设计依据与调参原理见 docs/ 两个指南文档。
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══ 每域名部署前【必改 / 必填】(PER-DOMAIN CHECKLIST) ═══
+#   1) name = "<domain>-com-log"
+#   2) account_id = 该域名所在账号(ss_vivo_static / ss_vivo_dynamic)
+#   3) [[r2_buckets]].bucket_name 与 [vars].R2_BUCKET_NAME = "<domain>-com"(两处一致)
+#   4) 4 个队列名统一加 <domain> 后缀(2 producers + 4 consumers + 4 个 *_QUEUE_NAME/*_DLQ_NAME):
+#      parse-queue / send-queue / parse-dlq / send-dlq-<domain>
+#   5) [vars].FIELD11_SERVER_IP = 该域名 anycast IP(第 11 字段,【必填】,如 172.65.90.64)
+#   6) 3 个 secret:wrangler secret put CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE
+#   其余 [vars] 保持默认。设计依据 / 调参原理见 docs/。
 
-# ─── 基础配置 ───────────────────────────────────────────────────────────────────
 name = "ctyun-logpush"                              # 改成 "<domain>-com-log"
 account_id = "0297df3199a94c8082d099ac2212c40a"     # 改成该域名所在账号 ID
 main = "src/index.js"
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
-# 开启 Workers Trace Events Logpush：把本 worker 的 trace events（含 console.log/异常）推到
-# 独立的 Logpush job（数据集 workers_trace_events → R2），绕开 observability 的账号级
-# 5B/天→1% 采样，便于排障拿到字面日志。⚠️ 仅当账号侧已建 workers_trace_events Logpush job
-# 指向目的地(如 R2)时才真正落数据；且 China Network 的 zone 不支持（本项目为 CF Global，可用）。
-logpush = true
+logpush = true                                      # Workers Trace Events Logpush(需账号侧已建 job 才落数据)
 
-# ─── Cron 触发器：每分钟驱动 scheduled() 补扫（reconciliation）安全网───────────────────
-# 实时性主路径是 R2 Event Notification → queue；但该通知是 best-effort，偶发漏/晚（实测晚 53min），
-# 对象已落 R2 却长时间无人处理 = 客户侧 gap，事件路径自身无法自愈（worker 没被触发）。
-# cron 每分钟补扫最近窗口内「已落桶超 grace 却无源级 .done」的对象并回灌 parse-queue，
-# 经源级+批次级 .done 幂等去重，不产生重复。scheduled() 内部全程 try/catch，不会抛 scriptThrewException。
-# ⚠️必须保留这条 crons（置空 [] 会关闭补扫 → 退回纯事件驱动 → 偶发 gap 复现）。
+# cron 每分钟驱动 scheduled() 补扫,兜底「R2 事件通知漏/晚」的对象。⚠️必须保留(置空=退回纯事件驱动→偶发 gap)。
 [triggers]
 crons = ["* * * * *"]
 
-# ─── R2 存储桶（binding 不要改）──────────────────────────────────────────────────
 [[r2_buckets]]
 binding     = "RAW_BUCKET"
-bucket_name = "cdn-logs-raw"                        # 改成 "<domain>-com"，并与 [vars].R2_BUCKET_NAME 一致
+bucket_name = "cdn-logs-raw"                        # 改成 "<domain>-com",与 [vars].R2_BUCKET_NAME 一致
 
-# ─── Queue 生产者（binding 不要改；queue 名改成带 <domain> 后缀）──────────────────
 [[queues.producers]]
 binding = "PARSE_QUEUE"
 queue   = "parse-queue"
@@ -47,15 +32,9 @@ queue   = "parse-queue"
 binding = "SEND_QUEUE"
 queue   = "send-queue"
 
-# ─── Queue 消费者 ─────────────────────────────────────────────────────────────────
-# max_batch_size=2 + [vars].PARSE_PARALLELISM=2：handleParseQueue 用「有界并发池」在单次 invocation 内
-#   并行解析 batch 内文件(同时最多 PARSE_PARALLELISM 个)。治本(2026-06 实测)：纯串行在最大域名
-#   (asia-vcode-od ~97 对象/min)真实完成(~77/min)追不上 ingest → 持续积压、客户少收；并发池把单 invocation 吞吐×P。
-#   max_batch_size 须 ≥ PARSE_PARALLELISM 才喂得满池(=1 则退化为串行)；取 2 正好喂满、单次 CPU/内存最小。
-#   内存安全：同时最多 P 个文件、每个流式 + 每 BATCH_SIZE 行 flush → 峰值≈P×数十MB，远低于旧版整 batch 全并行 OOM。
-#   CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件CPU < limits.cpu_ms(300s)。
-# max_concurrency 故意不设：由 autoscaler 横向扩 invocation（每队列上限 250）。
-# 单次 R2 读卡死的兜底见 [vars].PARSE_READ_IDLE_TIMEOUT_MS(空闲超时，默认 45000=开，全域统一)。调参原理见 docs/。
+# parse 消费者:有界并发池(同一 invocation 内最多 [vars].PARSE_PARALLELISM 个文件并行解析,提吞吐)。
+# max_batch_size 须 ≥ PARSE_PARALLELISM 才喂满池(=1 退化串行);每文件流式+每 BATCH_SIZE flush,峰值内存≈P×数十MB。
+# max_concurrency 不设:由 autoscaler 横向扩(每队列上限 250)。
 [[queues.consumers]]
 queue              = "parse-queue"                  # 与 producer / [vars].PARSE_QUEUE_NAME 一致
 max_batch_size     = 2
@@ -70,50 +49,46 @@ max_batch_timeout  = 5
 max_retries        = 5
 dead_letter_queue  = "send-dlq"
 
-# DLQ 自动重驱动消费者：把死信延迟回灌源队列，全自动自愈、无需人工。本身【不设 dead_letter_queue】。详见 docs/。
+# DLQ 自动重驱动:死信延迟回灌源队列、自愈;本身不设 dead_letter_queue。
 [[queues.consumers]]
-queue              = "parse-dlq"                    # 与 parse-queue 的 dead_letter_queue / [vars].PARSE_DLQ_NAME 一致
+queue              = "parse-dlq"                    # 与 [vars].PARSE_DLQ_NAME 一致
 max_batch_size     = 10
 max_batch_timeout  = 30
 max_retries        = 10
 max_concurrency    = 1
 
 [[queues.consumers]]
-queue              = "send-dlq"                     # 与 send-queue 的 dead_letter_queue / [vars].SEND_DLQ_NAME 一致
+queue              = "send-dlq"                     # 与 [vars].SEND_DLQ_NAME 一致
 max_batch_size     = 10
 max_batch_timeout  = 30
 max_retries        = 10
 max_concurrency    = 1
 
-# ─── 环境变量 ─────────────────────────────────────────────────────────────────────
-# 4 个队列名必须与上方 producers/consumers 完全一致（多域名时统一加 <domain> 后缀）。
-# FIELD11_SERVER_IP【必填】；其余均有默认值，一般不动。各项含义/调参原理见 docs/。
+# 4 个队列名须与上方 consumers/producers 一致;FIELD11_SERVER_IP【必填】,其余默认。
 [vars]
 PARSE_QUEUE_NAME = "parse-queue"
 SEND_QUEUE_NAME  = "send-queue"
 PARSE_DLQ_NAME   = "parse-dlq"
 SEND_DLQ_NAME    = "send-dlq"
-R2_BUCKET_NAME   = "cdn-logs-raw"                   # 必须与上方 [[r2_buckets]] bucket_name 一致
-FIELD11_SERVER_IP = ""                              # 【必填】该域名解析/anycast IP（第 11 字段 server_ip，如 172.65.90.64）；为空则输出 "-"
-BATCH_SIZE       = "2000"                           # ⚠️ 改此值前须先清空 DLQ（否则破坏 .done 幂等）
+R2_BUCKET_NAME   = "cdn-logs-raw"                   # 与上方 [[r2_buckets]] bucket_name 一致
+FIELD11_SERVER_IP = ""                              # 【必填】该域名 anycast IP(第 11 字段);空则输出 "-"
+BATCH_SIZE       = "2000"                           # ⚠️ 改此值前须先清空 DLQ(否则破坏 .done 幂等)
 RAW_LOG_PREFIX   = "logs/"
 RAW_LOG_SUFFIX   = ".log.gz"
 LOG_LEVEL        = "info"
-SEND_PARALLELISM = "2"                              # send 单次 invocation 内并行【发送】度（1=串行，建议 2，上限 8）
-PARSE_PARALLELISM = "2"                             # parse 单次 invocation 内并行【解析】度（有界并发池上限）。须 ≤ parse 的 max_batch_size 才喂得满；峰值内存≈P×数十MB，上限 8
+SEND_PARALLELISM = "2"                              # send 单次 invocation 并行【发送】度(1=串行,上限 8)
+PARSE_PARALLELISM = "2"                             # parse 单次 invocation 并行【解析】度(有界并发池;须 ≤ parse max_batch_size;上限 8)
 SEND_FETCH_TIMEOUT_MS = "120000"                    # 单次发送 fetch 超时(ms)
-# 解析读卡死兜底（空闲超时口径，全域统一一个值即可，不必按域名调）：
-PARSE_READ_IDLE_TIMEOUT_MS = "45000"                # 单次 R2 read() 空闲超时(ms)；卡死才触发、与对象大小无关。超时只重试该文件、不丢、不挡同批。0=不限
-# 补扫（reconciliation）参数：兜底「事件通知漏/晚」的对象，保 10min 内送达：
-RECONCILE_LOOKBACK_MINUTES = "120"                  # 回看窗口(min)：只考虑最近这段时间落桶的对象
-RECONCILE_GRACE_SECONDS    = "120"                  # 宽限(s)：落桶不足此时长的对象先交给事件路径(避免竞争重复)
-RECONCILE_MAX_ENQUEUE      = "500"                  # 单次补扫最多回灌对象数(防一次性回灌过多)
-RETRY_DELAY_SECONDS = "15"                          # 失败重试延迟(s)。调小：客户监控每~10min采集一次，让瞬时失败更快重发
-REDRIVE_BASE_DELAY_SECONDS = "20"                   # DLQ 重驱动退避基数(s)。调小：死信更快回灌重发
-REDRIVE_MAX_DELAY_SECONDS  = "120"                  # DLQ 重驱动退避封顶(s)。调小：确保死信恢复远小于客户10min采集窗口（原3600=1h会让恢复迟到）
+PARSE_READ_IDLE_TIMEOUT_MS = "45000"                # 单次 R2 read() 空闲超时(ms);卡死才触发,与对象大小无关;超时只重试该文件。0=不限
+RECONCILE_LOOKBACK_MINUTES = "60"                   # 补扫回看窗口(min):覆盖事件通知最大延迟(实测 ≤53min)
+RECONCILE_GRACE_SECONDS    = "120"                  # 宽限(s):落桶不足此时长先交给事件路径,避免竞争重复
+RECONCILE_MAX_ENQUEUE      = "100"                  # 单次补扫最多回灌对象数(防一次性回灌过多)
+RETRY_DELAY_SECONDS = "15"                          # 失败重试延迟(s)
+REDRIVE_BASE_DELAY_SECONDS = "20"                   # DLQ 重驱动退避基数(s)
+REDRIVE_MAX_DELAY_SECONDS  = "120"                  # DLQ 重驱动退避封顶(s)
 REDRIVE_JITTER_SECONDS     = "10"                   # DLQ 重驱动抖动(s)
 
-# ─── Observability：100% 采样 + 持久化 Logs（事故回看用）──────────────────────────
+# Observability:100% 采样 + 持久化 Logs(事故回看)
 [observability]
 enabled = true
 head_sampling_rate = 1
@@ -121,6 +96,6 @@ head_sampling_rate = 1
 enabled         = true
 invocation_logs = true
 
-# ─── CPU 时间上限：Enterprise 最大值 300000ms（给大文件域名留 CPU 余量）─────────────
+# CPU 上限:Enterprise 最大 300000ms(给大文件域名余量)
 [limits]
 cpu_ms = 300000
