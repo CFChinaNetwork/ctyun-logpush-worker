@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CF Logpush — Format Transform & Automated Push Guide</title>
+<title>CF Logpush — Format Transform &amp; Automated Push Guide</title>
 <style>
 :root {
   --orange: #f48120;
@@ -203,7 +203,7 @@ td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: 
 tr:hover td { background: rgba(255,255,255,0.02); }
 .env-table td:first-child { color: #79c0ff; font-family: monospace; font-size: 12.5px; }
 .env-table td:nth-child(2) { color: #a8daab; }
-.stars { color: var(--yellow); letter-spacing: 2px; }
+.must { color: var(--yellow); font-weight: 700; }
 footer {
   text-align: center;
   padding: 28px;
@@ -226,9 +226,7 @@ li { margin: 5px 0; font-size: 14px; }
 <nav>
   <a href="#overview">Overview</a>
   <a href="#architecture">Architecture</a>
-  <a href="#design">Design Decisions</a>
-  <a href="#pipeline">Pipeline Timing</a>
-  <a href="#performance">Performance</a>
+  <a href="#how">How It Works</a>
   <a href="#deploy">Deployment</a>
   <a href="#config">Configuration</a>
   <a href="#ops">Operations</a>
@@ -244,22 +242,22 @@ li { margin: 5px 0; font-size: 14px; }
     <div class="info-card">
       <div class="icon">🎯</div>
       <h4>Purpose</h4>
-      <p>Automatically transform Cloudflare edge access logs from JSON (Logpush format) into a custom CDN partner log format, and deliver them to a remote log ingestion endpoint in near real-time.</p>
+      <p>Transform Cloudflare edge access logs from the Logpush JSON format into the CDN partner 145-field format, and deliver them to the customer's log ingestion endpoint in near real time.</p>
     </div>
     <div class="info-card">
       <div class="icon">🏗️</div>
       <h4>Stack</h4>
-      <p>100% Cloudflare-native: Logpush + R2 + Queues + Workers. Zero servers, zero infrastructure maintenance, auto-scaling by design.</p>
+      <p>100% Cloudflare-native: Logpush + R2 + Queues + Workers. No servers, no infrastructure to maintain, autoscaling by design.</p>
     </div>
     <div class="info-card">
       <div class="icon">📋</div>
       <h4>Log Format</h4>
-      <p>Target: 145-field <code>\u0001</code>-delimited plaintext format. Body compressed with Gzip. Authentication via MD5 HMAC URL signing.</p>
+      <p>145 fields, <code>\u0001</code>-delimited plaintext. Body gzip-compressed. Authentication via an MD5 URL signature.</p>
     </div>
     <div class="info-card">
       <div class="icon">⚡</div>
-      <h4>End-to-End Latency</h4>
-      <p>Approximately <strong style="color:var(--green)">70 seconds</strong> from request to log delivery. Typically well within partner SLA requirements.</p>
+      <h4>Latency</h4>
+      <p>Roughly <strong style="color:var(--green)">1–2 minutes</strong> end to end (dominated by the ~1-minute Logpush batch interval).</p>
     </div>
   </div>
 
@@ -268,9 +266,9 @@ li { margin: 5px 0; font-size: 14px; }
     <tr><th>Service</th><th>Role</th><th>Location in Dashboard</th></tr>
     <tr><td><strong>Logpush</strong></td><td>Exports edge HTTP request logs to R2 (~1 min batches, gzip-compressed ndjson)</td><td>Domain → Analytics &amp; Logs → Logpush</td></tr>
     <tr><td><strong>R2 Object Storage</strong></td><td>Stores raw log files and processed batch files (temporary)</td><td>Dashboard → R2 Object Storage</td></tr>
-    <tr><td><strong>R2 Event Notifications</strong></td><td>Triggers a Queue message on every new object created in R2</td><td>R2 Bucket → Settings → Event Notifications</td></tr>
-    <tr><td><strong>Queues</strong></td><td>Decouples parse and send stages; guarantees at-least-once delivery with automatic retry</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
-    <tr><td><strong>Workers</strong></td><td>Two logical workers in one script: Parser and Sender</td><td>Deployed via <code>wrangler deploy</code> or GitHub Actions CI/CD</td></tr>
+    <tr><td><strong>R2 Event Notifications</strong></td><td>Sends a Queue message for every new raw log object created in R2</td><td>R2 Bucket → Settings → Event Notifications</td></tr>
+    <tr><td><strong>Queues</strong></td><td>Decouple the parse and send stages; at-least-once delivery with automatic retry and dead-letter queues</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
+    <tr><td><strong>Workers</strong></td><td>One script, three roles: Parser, Sender, and DLQ re-driver</td><td>Deployed via <code>wrangler deploy</code> or GitHub Actions</td></tr>
   </table>
 </section>
 
@@ -278,401 +276,138 @@ li { margin: 5px 0; font-size: 14px; }
 <section class="section" id="architecture">
   <div class="section-title"><div class="num">2</div>Architecture</div>
 
-  <div class="ascii-flow">┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              [Step 1] Log Generation                                │
-│                                                                                     │
-│   End user opens a webpage / app                                                    │
-│          │                                                                          │
-│          ▼                                                                          │
-│   Request reaches a Cloudflare edge node (300+ cities worldwide)                   │
-│          │                                                                          │
-│          │  CF records one log entry: client IP, timestamp, URL, status code,      │
-│          │  response size, cache status, latency...                                 │
-│          ▼                                                                          │
-│   CF edge processes the request; log entry is buffered in CF internal system       │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                     Every ~1 minute, Logpush automatically batches and pushes
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                         [Step 2] Logpush Writes to R2                               │
-│                                                                                     │
-│   Logpush service (fully automated):                                                │
-│   1. Packages all logs from the past ~1 minute (ndjson, one JSON object per line)  │
-│   2. Gzip compresses the file                                                       │
-│   3. Writes to R2 bucket                                                            │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  R2 Bucket: cdn-logs-raw                │                                      │
-│   │  logs/                                  │                                      │
-│   │  └── 20260328/                          │ ← auto-partitioned by date           │
-│   │      ├── 20260328T090000Z_xxx.log.gz    │ ← each file a few KB to a few MB    │
-│   │      ├── 20260328T090100Z_xxx.log.gz    │ ← filename contains timestamp        │
-│   │      └── ... (new file every ~1 min)    │                                      │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                 R2 detects new object → immediately fires Event Notification (seconds)
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     [Step 3] R2 Event Notification → parse-queue                    │
-│                                                                                     │
-│   R2 Event Notification sends a message to parse-queue:                             │
-│   { "bucket": "cdn-logs-raw", "object": { "key": "logs/20260328/xxx.log.gz" } }    │
-│   (Message contains only the file path — a few dozen bytes, never exceeds 128 KB)  │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  Queue: parse-queue                     │                                      │
-│   │  msg 1: { key: "logs/.../a.log.gz" }   │ ← file path only, no log content     │
-│   │  msg 2: { key: "logs/.../b.log.gz" }   │ ← auto-batched, auto-retry           │
-│   │  ...                                    │                                      │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                    Queue wakes up Parser Worker when messages arrive (~3-5 seconds)
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                  [Step 4] Parser Worker — Read, Decompress, Parse, Transform        │
-│                                                                                     │
-│   ① Obtain streaming reference to .gz file from R2 (no full download)              │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ② Stream decompress via DecompressionStream — only a few KB in memory at a time  │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ③ Split by newline, parse each line as JSON (one CF log entry per line)          │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ④ Format transform (transformEdge function)                                       │
-│      CF JSON → \u0001-delimited 145-field plaintext format                         │
-│                                                                                     │
-│      Before: { "RayID":"9e34...", "ClientIP":"221.229...", "EdgeColoCode":"HGH" }  │
-│      After:  cs_vod_v3.0\u0001[28/Mar/2026:16:42:25 +0800]\u00019e34...\u0001200  │
-│              \u00011774680145.000\u00010.149\u0001...(145 fields total)            │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ⑤ Every 2000 lines (or end of file) → write R2 temp file + send to send-queue   │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                              Write R2 temp file, enqueue message
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                    [Step 5] R2 Temp File + send-queue                               │
-│                                                                                     │
-│   R2 temp file (processed/ directory, already in target format):                   │
-│   processed/logs_20260328_xxx-0.txt                ← up to 2000 log lines          │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  Queue: send-queue                      │                                      │
-│   │  msg: { "key": "processed/...txt" }    │ ← file path only, a few dozen bytes  │
-│   │  ...                                    │ ← auto-retry up to 5x → send-dlq    │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                    Queue wakes up Sender Worker when messages arrive (~3-5 seconds)
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                   [Step 6] Sender Worker — Compress, Sign, Send                     │
-│                                                                                     │
-│   ① Read temp file from R2 (up to 2000 lines in target format)                      │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ② Gzip compress body (required by partner spec)                                   │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ③ Compute MD5 auth signature:                                                     │
-│      ts      = current Unix time + 300s                                             │
-│      rand    = random integer                                                       │
-│      sigstr  = "{uri}-{ts}-{rand}-{privateKey}"                                    │
-│      md5hash = MD5(sigstr)                                                          │
-│      URL     = {endpoint}{uri}?auth_key={ts}-{rand}-{md5}                          │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ④ HTTP POST to partner log ingestion server (Content-Encoding: gzip)             │
-│          │                                                                          │
-│          ├── Success (HTTP 200) → ack message + delete R2 temp file ✅             │
-│          └── Failure → retry → up to 5x → send-dlq on exhaustion ⚠️              │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           [Step 7] Partner Ingestion                                │
-│   Verify auth → Gzip decompress → split on \u0001 → write to billing/analytics DB ✓│
-└─────────────────────────────────────────────────────────────────────────────────────┘</div>
+  <p>The pipeline is event-driven end to end. A single Worker script consumes all four queues: <code>parse-queue</code> (Parser), <code>send-queue</code> (Sender), and <code>parse-dlq</code> / <code>send-dlq</code> (DLQ re-driver). The diagram below shows each stage with the <code>wrangler.toml</code> parameters that govern it.</p>
 
-  <div class="tip tip-info">Queue messages carry only R2 object keys (a few dozen bytes), never log content. This sidesteps the 128 KB Queue message size limit entirely.</div>
+  <div class="ascii-flow">End user ──▶ Cloudflare edge (300+ cities)  ── records one http_requests log line
+                          │
+                          ▼
+┌─ ① Logpush job ──────────────────────────────────────────────────────────────┐
+│  Batches ~1 min of logs (ndjson), gzip-compresses, writes to R2.              │
+└──────────────────────────────┬────────────────────────────────────────────────┘
+                               ▼   R2 bucket  &lt;domain&gt;-com
+                                   key: logs/YYYYMMDD/&lt;start&gt;_&lt;end&gt;_&lt;id&gt;.log.gz
+                          ┌──────┴───────────────────────────────────────────────┐
+                          │ R2 Event Notification (object-create, prefix logs/)   │
+                          │ → one message per new file (key only, &lt; 128 KB)       │
+                          ▼
+╔═ ② parse-queue-&lt;domain&gt; ══════════════════════════════════════════════════════╗
+║  max_batch_size 2 · max_batch_timeout 5s · max_retries 5 → parse-dlq           ║
+║  PARSE_PARALLELISM 2  (files parsed in parallel within one invocation)         ║
+║  max_concurrency unset → autoscales (per-queue cap 250)                        ║
+╚════════════════════════════════┬═══════════════════════════════════════════════╝
+                                 ▼   Parser — per file:
+   1. source-level .done exists?  → ack &amp; skip            (idempotent)
+   2. R2 get → stream-decompress (gzip); per-read idle timeout 45s
+      (a stalled read is aborted and only that file retried)
+   3. transform each line → 145-field \u0001 CDN format
+   4. every BATCH_SIZE (2000) lines → write R2 processed/&lt;key&gt;-&lt;i&gt;.txt + enqueue send
+   5. all batches enqueued → write source-level .done      (failure → retry → parse-dlq)
+                                 ▼
+╔═ ③ send-queue-&lt;domain&gt; ═══════════════════════════════════════════════════════╗
+║  max_batch_size 50 · max_batch_timeout 5s · max_retries 5 → send-dlq           ║
+║  SEND_PARALLELISM 2  (POSTs in parallel within one invocation)                 ║
+║  max_concurrency unset → autoscales (per-queue cap 250)                        ║
+╚════════════════════════════════┬═══════════════════════════════════════════════╝
+                                 ▼   Sender — per batch:
+   1. batch-level .done exists?   → skip                  (no double POST)
+   2. R2 get → stream gzip → POST customer endpoint
+      auth_key = ts-rand-md5(uri-ts-rand-privateKey);  field #11 = FIELD11_SERVER_IP
+      per-fetch timeout SEND_FETCH_TIMEOUT_MS (30s)
+   3. HTTP 2xx → write batch-level .done → delete R2 temp file   (failure → retry → send-dlq)
+                                 ▼
+┌─ ④ Customer ingestion endpoint ───────────────────────────────────────────────┐
+│  Verify auth → gunzip → split on \u0001 → store.  Must accept HTTP/1.1 chunked. │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+Self-healing DLQ:  parse-dlq / send-dlq are consumed by the same Worker and re-driven
+   to their source queue with exponential backoff + jitter (base 60s, cap 3600s, jitter 30s).
+   The deterministic batch key + .done markers keep re-drive duplicate-free.</div>
+
+  <div class="tip tip-info">Queue messages carry only R2 object keys (a few dozen bytes), never log content — this stays well under the 128 KB Queue message limit.</div>
+  <div class="tip tip-warn">Configure the R2 Event Notification for raw objects <strong>only</strong>: <code>object-create</code> with prefix <code>logs/</code>. Notifying on the whole bucket would feed <code>processed/</code> and marker files back into <code>parse-queue</code>.</div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="design">
-  <div class="section-title"><div class="num">3</div>Key Design Decisions</div>
+<section class="section" id="how">
+  <div class="section-title"><div class="num">3</div>How It Works</div>
 
   <div class="card">
-    <h4>Streaming Gzip Decompression</h4>
-    <p>Raw log files are processed via <code>DecompressionStream</code> + <code>ReadableStream</code>. The Worker never buffers the full file in memory — it decompresses and transforms line-by-line, keeping memory usage constant regardless of file size. This is essential given the 128 MB Worker memory limit.</p>
+    <h4>Streaming, Bounded Parse</h4>
+    <p>Raw files are read through <code>DecompressionStream</code> and transformed line by line; the Worker never buffers a whole file. Each batch (<code>BATCH_SIZE</code> = 2000 lines) is flushed to R2 and enqueued as it fills, so peak memory is bounded by the batch size, not the file size. Within one invocation a small pool (<code>PARSE_PARALLELISM</code>) parses up to that many files in parallel; <code>max_batch_size</code> must be ≥ that value.</p>
 
-    <h4>Multi-Queue, Single-Worker Architecture</h4>
-    <p>A single Worker script consumes all queues. <strong>parse-queue</strong> drives R2 → transform; <strong>send-queue</strong> drives R2 → HTTP POST; <strong>parse-dlq</strong> / <strong>send-dlq</strong> are also consumed by the same Worker. Each main queue retries up to 5× on failure and then dead-letters; the Worker re-drives DLQ messages back to their source queue with exponential backoff + jitter, so transient failures self-heal automatically — no alerts, no manual draining.</p>
+    <h4>Per-Read Idle Timeout</h4>
+    <p>Each R2 read carries an idle timeout (<code>PARSE_READ_IDLE_TIMEOUT_MS</code>, default 45s). A read that stalls is aborted and only that one file is retried, so a single stuck object never blocks the queue. Because it is a per-read idle timeout (not a whole-file deadline), the same value is safe for any file size — a healthy large file emits chunks continuously and never trips it.</p>
 
-    <h4>Duplicate Delivery Control</h4>
-    <p>Queues use at-least-once semantics. The Sender processes messages sequentially within each invocation via <code>for-await</code>; <code>send-queue</code> leaves <code>max_concurrency</code> unset, so the Queue autoscaler runs multiple invocations concurrently to keep throughput up. After a confirmed send, the Worker writes a <code>.done</code> marker; later duplicate messages are skipped when the marker exists or the temporary batch file is already gone — this narrows the duplicate window inherent to Queue at-least-once redelivery.</p>
+    <h4>Idempotent Delivery (no receiver de-dup)</h4>
+    <p>Queue delivery is at-least-once. The parser writes each batch under a deterministic key (<code>processed/&lt;safeKey&gt;-&lt;index&gt;.txt</code>); after a confirmed POST the Sender writes a <code>.done</code> marker. On any re-processing, batches that already have a <code>.done</code> marker are skipped, so a batch is never POSTed twice. A source-level <code>.done</code> additionally lets the parser skip a file it has already fully processed. The receiver needs no de-duplication of its own.</p>
 
-    <h4>Timestamp Handling</h4>
-    <p>The parser auto-detects <code>EdgeStartTimestamp</code> in three formats: Unix seconds integer, Unix milliseconds integer, and RFC 3339 string. Logpush is recommended to be configured with <code>timestamp_format = unix</code> for consistency.</p>
+    <h4>Self-Healing Dead Letters</h4>
+    <p>Each main queue retries up to 5× and then dead-letters. The same Worker consumes <code>parse-dlq</code> / <code>send-dlq</code> and re-drives messages back to their source queue with exponential backoff + jitter. Transient failures recover automatically — no alerts, no manual draining. (Re-drive relies on the same deterministic key + <code>.done</code> markers, so it never causes a duplicate send.)</p>
 
-    <h4>CDN Node Country Mapping</h4>
-    <p>The target format requires the <em>CDN node country</em> (not client country). <code>EdgeColoCode</code> (IATA airport code, e.g. <code>NRT</code> = Tokyo) is mapped to ISO 3166-1 alpha-2 country code via a built-in lookup table maintained against active Cloudflare POP airport codes. If <code>EdgeColoCode</code> is empty or not in the table, the Worker falls back to <code>SG</code>.</p>
+    <h4>Streaming, Chunked Send</h4>
+    <p>The Sender streams <code>R2 object → gzip → fetch body</code>, keeping memory per request small. The request uses HTTP/1.1 <code>Transfer-Encoding: chunked</code> (no <code>Content-Length</code>). <strong>The customer endpoint must accept chunked request bodies</strong>; HTTP <code>400</code> / <code>411</code> / <code>415</code> indicates it does not. Each POST is bounded by <code>SEND_FETCH_TIMEOUT_MS</code> (default 30s) so a stalled receiver is aborted and retried. Within one invocation a small pool (<code>SEND_PARALLELISM</code>) sends multiple batches in parallel; multiple invocations also run concurrently under the autoscaler.</p>
 
-    <h4>Request Duration (Field #6)</h4>
-    <p>Field #6 is calculated as <code>EdgeEndTimestamp - EdgeStartTimestamp</code>, in seconds with millisecond precision. This measures from Cloudflare edge receiving the request to finishing the response to the client.</p>
+    <h4>CDN Node Country (Field #45)</h4>
+    <p>The format requires the CDN node country (not the client country). <code>EdgeColoCode</code> (IATA airport code, e.g. <code>NRT</code> = Tokyo) is mapped to an ISO 3166-1 alpha-2 code via a built-in lookup table. If the code is empty or unmapped, the Worker falls back to <code>SG</code>.</p>
 
     <h4>MD5 Authentication</h4>
-    <p>Workers' <code>SubtleCrypto</code> API does not support MD5. A pure-JS RFC 1321 implementation is included in <code>src/index.js</code>. The auth URL signature format is: <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>.</p>
+    <p>Workers' <code>SubtleCrypto</code> does not implement MD5, so a pure-JS RFC 1321 implementation is included. The URL signature is <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>, sent as <code>auth_key={ts}-{rand}-{md5}</code>.</p>
 
-    <h4>Response Content-Length (Field #21)</h4>
-    <p>The <code>http_requests</code> dataset does not expose a dedicated <code>Content-Length</code> field. Field #21 is populated from <code>ResponseHeaders['content-length']</code> when Logpush Custom Fields are configured via API (see Step 6b in Deployment). If not configured or the header is absent, the field returns <code>-</code>.</p>
-    <div class="tip tip-info">Custom Fields configuration for <code>content-length</code> is optional. Without it, field #21 will consistently output <code>-</code>, which is the standard placeholder for unavailable fields in this format.</div>
+    <h4>Timestamp &amp; Content-Length</h4>
+    <p>The parser auto-detects <code>EdgeStartTimestamp</code> in three formats (Unix seconds, Unix milliseconds, RFC 3339); configuring Logpush with <code>timestamp_format = unix</code> is recommended. Field #21 (<code>sent_http_content_length</code>) is populated from <code>ResponseHeaders['content-length']</code> when Logpush Custom Fields are configured (optional — see Deployment); otherwise it returns <code>-</code>.</p>
   </div>
 
   <h3>Reliability Model</h3>
   <table>
-    <tr><th>Failure Scenario</th><th>Behavior</th><th>Recovery</th></tr>
-    <tr><td>Remote endpoint temporarily unavailable</td><td>send-queue retries up to 5× with a delay between attempts</td><td>Automatic; R2 file preserved until delivery confirmed</td></tr>
-    <tr><td>Remote endpoint hangs on a single request</td><td>Per-fetch timeout <code>SEND_FETCH_TIMEOUT_MS</code> (default 120s): the POST is aborted and falls back to queue retry</td><td>Automatic; prevents a single invocation from exhausting the Queue consumer's 15-min wall-time limit</td></tr>
-    <tr><td>Malformed log record in source file</td><td>Per-line error caught; line skipped; batch continues</td><td>Error count logged; file-level processing succeeds</td></tr>
-    <tr><td>Parser fails on a file (transient I/O, etc.)</td><td>parse-queue retries 5×; on exhaustion moves to parse-dlq</td><td>Automatic — see next row</td></tr>
-    <tr><td>A message reaches a DLQ (parse-dlq / send-dlq)</td><td>The same Worker consumes the DLQ and re-enqueues to the source queue with exponential backoff + jitter</td><td>Fully automatic self-healing; transient failures recover with no manual draining and no permanent loss</td></tr>
-    <tr><td>Duplicate Queue delivery</td><td>Existing <code>.done</code> marker or missing R2 temp file → silent ack</td><td>At-least-once delivery; idempotency converged by the deterministic batch key + <code>.done</code> marker (receiver needs no de-dup)</td></tr>
+    <tr><th>Scenario</th><th>Behavior</th><th>Recovery</th></tr>
+    <tr><td>Endpoint temporarily unavailable</td><td>send-queue retries up to 5× with a delay between attempts</td><td>Automatic; R2 file preserved until delivery is confirmed</td></tr>
+    <tr><td>Endpoint hangs on a single request</td><td>Per-POST timeout <code>SEND_FETCH_TIMEOUT_MS</code> (default 30s) aborts and falls back to queue retry</td><td>Automatic; one invocation never holds open against the 15-min consumer limit</td></tr>
+    <tr><td>R2 read stalls on one file</td><td>Per-read idle timeout (<code>PARSE_READ_IDLE_TIMEOUT_MS</code>, 45s) aborts and retries that single file</td><td>Automatic; a stuck object never blocks the rest of the queue</td></tr>
+    <tr><td>Malformed log record</td><td>Per-line error caught, line skipped, batch continues</td><td>Error count logged; file-level processing still succeeds</td></tr>
+    <tr><td>Parser/Sender fails a file/batch</td><td>Queue retries 5×, then moves to its DLQ</td><td>Automatic — see next row</td></tr>
+    <tr><td>A message reaches a DLQ</td><td>Same Worker re-drives it to the source queue with exponential backoff + jitter</td><td>Fully automatic self-healing; no manual draining, no permanent loss</td></tr>
+    <tr><td>Duplicate Queue delivery</td><td>Existing <code>.done</code> marker (or missing temp file) → silent skip</td><td>Idempotency converged by the deterministic key + <code>.done</code> marker</td></tr>
   </table>
-</section>
-
-<!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="pipeline">
-  <div class="section-title"><div class="num">4</div>Pipeline Timing &amp; Trigger Mechanism</div>
-
-  <h3>End-to-End Flow Timeline</h3>
-  <div class="ascii-flow">t = 0s       CF edge node records HTTP request log (buffered internally)
-                │
-                │  Logpush batches every ~60 seconds
-                ▼
-t = ~60s     Logpush packages all logs from the past ~60s into a .log.gz file
-             and writes it to R2 bucket (cdn-logs-raw/logs/YYYYMMDD/)
-             File size: a few KB (low traffic) to hundreds of MB (peak traffic)
-                │
-                │  R2 Event Notification fires immediately (2–5 seconds)
-                ▼
-t = ~63s     parse-queue receives one message: { key: "logs/.../xxx.log.gz" }
-             (message carries only the R2 object path, never log content)
-                │
-                │  Queue schedules Worker (3–15 seconds depending on concurrency)
-                ▼
-t = ~70s     Parser Worker starts processing:
-             │  ① Fetch .log.gz stream from R2 (no full download)
-             │  ② Stream decompress via DecompressionStream
-             │  ③ Parse each line as JSON
-             │  ④ Transform to 145-field \u0001-delimited format
-             │  ⑤ Every 2000 lines → write R2 temp file → send to send-queue
-             │  ⑥ Remaining lines at end of file → also written and enqueued
-             │
-             │  Processing time: &lt;1s (small file) to 30s (hundreds of MB)
-             ▼
-t = ~80s     send-queue receives message(s): { key: "processed/xxx.txt" }
-                │
-                │  Queue schedules Worker (3–5 seconds)
-                ▼
-t = ~85s     Sender Worker starts processing:
-             │  ① Read temp file from R2 (up to 2000 lines, target format)
-             │  ② Gzip compress body
-             │  ③ Compute MD5 auth signature
-             │  ④ HTTP POST → partner log ingestion server
-             │  ⑤ HTTP 200 → ack message + delete R2 temp file
-             │  ⑤ Non-200  → throw error → Queue retry (up to 5×)
-             ▼
-t = ~90s     Logs successfully delivered to partner endpoint ✓
-
-Total end-to-end latency: ~75–120 seconds
-(Logpush ~60s + R2 notification ~5s + Queue scheduling ~10s + processing ~10s + send ~5s)</div>
-
-  <h3>Per-Stage Trigger Mechanism</h3>
-  <div class="card">
-    <h4>Stage 1 — Logpush → R2 &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Time-driven, ~60s interval</span></h4>
-    <p>Logpush batches all logs from the past ~60 seconds and writes a single compressed file to R2. The real-time path is then event-driven (R2 Event Notification → queues); a separate cron-driven reconciliation sweep (every minute) re-processes any object whose notification was delayed or dropped, since R2 Event Notifications are best-effort.</p>
-    <p>One file per batch regardless of traffic volume — a low-traffic file may contain 3 lines; a peak-traffic file may contain hundreds of thousands of lines.</p>
-
-    <h4>Stage 2 — R2 → parse-queue &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Event-driven, 1 file = 1 message</span></h4>
-    <p>Every new object written to R2 immediately triggers an Event Notification, inserting exactly one message into parse-queue. The message contains only the R2 object key (a few dozen bytes).</p>
-    <p>Latency from R2 write to Queue message visibility: typically 2–5 seconds.</p>
-
-    <h4>Stage 3 — Parser &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Event-driven, one file per invocation</span></h4>
-    <p>The parse-queue consumer uses <strong>max_batch_size = 1</strong>: each invocation processes exactly one file and fires as soon as a message is available. Handling one file at a time keeps per-invocation memory and CPU bounded regardless of file size or per-record size; throughput scales horizontally via consumer autoscaling (per-queue cap 250).</p>
-    <p>Within a file, the Parser writes one R2 temp file and sends one send-queue message for every <strong>2000</strong> lines (<code>BATCH_SIZE</code>). Remaining lines (fewer than 2000) at end of file are always flushed — no data is held back.</p>
-    <p><strong>Example — 4,500-line file:</strong></p>
-    <pre>Lines 1–2000    → processed/xxx-0.txt (2000 lines) + send-queue message
-Lines 2001–4000 → processed/xxx-1.txt (2000 lines) + send-queue message
-Lines 4001–4500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre>
-
-    <h4>Stage 4 — Sender Worker &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">Event-driven, batched by max_batch_size / max_batch_timeout</span></h4>
-    <p>The Worker is woken up when either condition is met:</p>
-    <ul style="font-size:14px; margin:6px 0 10px 20px;">
-      <li><strong>max_batch_size = 50</strong>: up to 50 messages delivered to one invocation</li>
-      <li><strong>max_concurrency unset</strong>: Queue autoscaler scales invocations as needed (current platform cap 250)</li>
-      <li><strong>max_batch_timeout = 5s</strong>: fewer than 50 messages but 5 seconds elapsed → Worker fires anyway</li>
-    </ul>
-    <p>Each message triggers one HTTP POST. Within a single invocation the messages are processed by a small parallel pool (<code>SEND_PARALLELISM</code>, default 2); multiple invocations also run concurrently under autoscaler control to sustain throughput. Failed sends are retried by the Queue (up to 5×); on exhaustion they move to send-dlq and are then automatically re-driven back to send-queue.</p>
-  </div>
-
-  <h3>Pipeline Parameter Reference</h3>
-  <table>
-    <tr><th>Parameter</th><th>Location</th><th>Current Value</th><th>Effect</th></tr>
-    <tr><td>Logpush interval</td><td>Logpush Job config</td><td>~60s (CF internal)</td><td>The only clock in the pipeline; determines minimum end-to-end latency</td></tr>
-    <tr><td>R2 → Queue notification</td><td>R2 Event Notification</td><td>2–5s (CF internal)</td><td>Fixed overhead; not configurable</td></tr>
-    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>1</td><td>One file per invocation — bounds per-invocation memory &amp; CPU</td></tr>
-    <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>With batch size 1, fires as soon as a message is available</td></tr>
-    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>Max messages delivered per Sender invocation</td></tr>
-    <tr><td>parse-queue / send-queue max_concurrency</td><td>wrangler.toml</td><td><em>unset</em> (autoscale, per-queue cap 250)</td><td>Left unset so high-traffic domains scale freely</td></tr>
-    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>Max wait before firing Sender with fewer than 50 messages</td></tr>
-    <tr><td>parse-dlq / send-dlq consumers</td><td>wrangler.toml</td><td>batch 10, retries 10, concurrency 1</td><td>Same Worker drains each DLQ and re-drives to its source queue (self-healing)</td></tr>
-    <tr><td>BATCH_SIZE</td><td>wrangler.toml [vars]</td><td>2000</td><td>Max log lines per HTTP POST payload; validated range 1–2000</td></tr>
-    <tr><td>SEND_FETCH_TIMEOUT_MS</td><td>wrangler.toml [vars]</td><td>120000</td><td>Per-POST abort timeout (ms) for a stalled receiver</td></tr>
-    <tr><td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>wrangler.toml [vars]</td><td>60 / 3600 / 30</td><td>DLQ re-drive exponential-backoff base, cap, and jitter</td></tr>
-    <tr><td>parse-queue max_retries</td><td>wrangler.toml</td><td>5</td><td>Parse failures retry 5× before moving to parse-dlq (then auto re-driven)</td></tr>
-    <tr><td>send-queue max_retries</td><td>wrangler.toml</td><td>5</td><td>Send failures retry 5× before moving to send-dlq (then auto re-driven)</td></tr>
-    <tr><td>cpu_ms</td><td>wrangler.toml [limits]</td><td>300000</td><td>Per-invocation CPU limit (Enterprise max, 5 min)</td></tr>
-  </table>
-
-</section>
-
-<!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="performance">
-  <div class="section-title"><div class="num">5</div>Performance Characteristics</div>
-
-
-  <p style="font-size:13px; color:#888; margin-bottom:12px;">Measured: 2026-03-30, 6-hour window (11:00–17:00 GMT+8) · HTTP traffic: 13.31M requests · Data transfer: 70.39 GB</p>
-
-  <h3>Worker</h3>
-  <table>
-    <tr><th>Metric</th><th>Observed</th><th>Assessment</th></tr>
-    <tr><td>Worker invocations (6h)</td><td>2k</td><td style="color:var(--green)">Matches Logpush batch count</td></tr>
-    <tr><td>Errors (internal)</td><td>0</td><td style="color:var(--green)">Clean</td></tr>
-    <tr><td>Exceeded CPU Time Limits</td><td>3</td><td style="color:var(--yellow)">Occurred at peak; monitor if increasing</td></tr>
-    <tr><td>Exceeded Memory</td><td>0</td><td style="color:var(--green)">Streaming design effective</td></tr>
-    <tr><td>Median CPU Time</td><td>3.52 ms</td><td style="color:var(--green)">Far below 30s limit</td></tr>
-    <tr><td>P90 CPU Time</td><td>355 ms</td><td style="color:var(--green)">Normal for large file batches</td></tr>
-    <tr><td>P99 CPU Time</td><td>3.17s</td><td style="color:var(--green)">Within 30s limit</td></tr>
-    <tr><td>Wall Time P50 / P99</td><td>1.13s / 18.97s</td><td style="color:var(--green)">Within limits including network wait</td></tr>
-    <tr><td>5xx subrequests (to partner)</td><td>36 / 15k</td><td style="color:var(--yellow)">0.24% — partner-side intermittent; auto-retried</td></tr>
-  </table>
-
-  <h3>parse-queue</h3>
-  <table>
-    <tr><th>Metric</th><th>Observed</th><th>Assessment</th></tr>
-    <tr><td>Messages ingested (6h)</td><td>355</td><td style="color:var(--green)">Matches Logpush file count</td></tr>
-    <tr><td>Messages acknowledged</td><td>347 (97.7%)</td><td style="color:var(--green)">Healthy</td></tr>
-    <tr><td>Messages retried</td><td>0</td><td style="color:var(--green)">No parse failures</td></tr>
-    <tr><td>Realtime backlog</td><td>0</td><td style="color:var(--green)">Real-time consumption</td></tr>
-    <tr><td>Average backlog (avg/peak)</td><td>5.47 / 13</td><td style="color:var(--green)">Light</td></tr>
-    <tr><td>Consumer lag time (avg/peak)</td><td>15.13s / ~250s</td><td style="color:var(--yellow)">Peak lag at traffic burst; acceptable</td></tr>
-    <tr><td>Consumer concurrency (avg/peak)</td><td>1.37 / 14</td><td style="color:var(--green)">Auto-scaled effectively</td></tr>
-    <tr><td>DLQ messages</td><td>0</td><td style="color:var(--green)">No data loss</td></tr>
-  </table>
-
-  <h3>send-queue</h3>
-  <table>
-    <tr><th>Metric</th><th>Observed</th><th>Assessment</th></tr>
-    <tr><td>Messages ingested (6h)</td><td>14.9k</td><td style="color:var(--green)">~14.9M log lines delivered</td></tr>
-    <tr><td>Messages acknowledged</td><td>15.45k</td><td style="color:var(--green)">Including prior backlog clearance</td></tr>
-    <tr><td>Messages retried</td><td>0</td><td style="color:var(--green)">No send failures escalated to queue</td></tr>
-    <tr><td>Realtime backlog</td><td>0</td><td style="color:var(--green)">Real-time consumption</td></tr>
-    <tr><td>Average backlog (avg/peak)</td><td>32.6 / 106</td><td style="color:var(--yellow)">Moderate at peak; within capacity</td></tr>
-    <tr><td>Consumer lag time (avg/peak)</td><td>5.62s / ~55s</td><td style="color:var(--green)">Acceptable</td></tr>
-    <tr><td>Consumer concurrency (avg/peak)</td><td>22.07 / ~220</td><td style="color:var(--green)">Autoscaler ramps based on backlog</td></tr>
-    <tr><td>DLQ messages</td><td>0</td><td style="color:var(--green)">No data loss</td></tr>
-  </table>
-
-  <h3>Capacity Headroom</h3>
-  <table>
-    <tr><th>Dimension</th><th>Current Load</th><th>5× Traffic</th><th>10× Traffic</th></tr>
-    <tr><td>Worker CPU</td><td>~5% of limit</td><td style="color:var(--green)">Safe</td><td style="color:var(--yellow)">P99 near limit on large files</td></tr>
-    <tr><td>Worker Memory</td><td>0 overruns</td><td style="color:var(--green)">Safe (streaming design)</td><td style="color:var(--green)">Safe</td></tr>
-    <tr><td>parse-queue lag</td><td>avg 15s, peak 250s</td><td style="color:var(--yellow)">Peak lag ~5–10 min</td><td style="color:var(--red)">Sustained backlog risk</td></tr>
-    <tr><td>send-queue concurrency</td><td>autoscales up to 250 invocations × 1 POST</td><td style="color:var(--green)">Ample headroom</td><td style="color:var(--yellow)">Backlog may grow if receiver is slow</td></tr>
-    <tr><td>Partner endpoint</td><td>0.24% 5xx</td><td style="color:var(--yellow)">Monitor 5xx rate</td><td style="color:var(--red)">Likely bottleneck</td></tr>
-  </table>
-  <div class="tip tip-info">Overall assessment: the system operates comfortably at current traffic levels. send-queue autoscales by default; the narrow race window across concurrent invocations is converged by the <code>.done</code> marker, with no customer-side changes required.</div>
-
-  <h3>Key Metrics to Monitor</h3>
-  <table>
-    <tr><th>Priority</th><th>Metric</th><th>Alert Threshold</th></tr>
-    <tr><td>★★★</td><td>DLQ message count (both queues)</td><td>&gt; 0 — immediate action</td></tr>
-    <tr><td>★★★</td><td>Realtime Backlog (sustained)</td><td>&gt; 100 messages for &gt; 5 min</td></tr>
-    <tr><td>★★★</td><td>Exceeded CPU Time Limits</td><td>&gt; 10 per hour</td></tr>
-    <tr><td>★★</td><td>Consumer Lag Time (parse-queue)</td><td>Sustained &gt; 5 minutes</td></tr>
-    <tr><td>★★</td><td>5xx subrequests rate</td><td>&gt; 0.5% of total</td></tr>
-    <tr><td>★★</td><td>send-queue backlog / lag</td><td>Sustained growth for &gt; 5 minutes</td></tr>
-    <tr><td>★</td><td>P99 CPU Time</td><td>&gt; 20s</td></tr>
-  </table>
-
-
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="deploy">
-  <div class="section-title"><div class="num">6</div>Deployment Guide</div>
+  <div class="section-title"><div class="num">4</div>Deployment</div>
 
-  <div class="tip tip-warn">Prerequisites: Node.js v18+ installed locally. Wrangler CLI installed (<code>npm install -g wrangler</code>). A Cloudflare API Token scoped to the target account with the following permissions: <strong>Workers Scripts:Edit</strong>, <strong>Workers R2 Storage:Edit</strong>, and <strong>Workers Queue:Edit</strong> (use the Edit Cloudflare Workers template and manually add the R2 and Queue permissions).</div>
+  <div class="tip tip-warn">Prerequisites: Node.js v18+ and Wrangler CLI locally; a Cloudflare API Token scoped to the target account with <strong>Workers Scripts:Edit</strong>, <strong>Workers R2 Storage:Edit</strong>, and <strong>Workers Queue:Edit</strong>. From your log partner, obtain the endpoint URL, the auth private key, and the target URI path.</div>
 
-  <div class="tip tip-warn"><strong>Customize <code>wrangler.toml</code> for your deployment:</strong>
-    <ul style="margin:6px 0 0 20px; font-size:13.5px;">
-      <li><code>name</code> → your Worker name (any unique name)</li>
-      <li><strong><code>account_id</code> → must change to your own Cloudflare Account ID</strong> (Dashboard → right corner, or <code>wrangler whoami</code>)</li>
-      <li><code>bucket_name</code> → your R2 bucket name (created in Step 1)</li>
-      <li><code>R2_BUCKET_NAME</code> in <code>[vars]</code> → must match <code>bucket_name</code> above</li>
-      <li>Queue names (<code>queue = "..."</code> in producers &amp; consumers) → your Queue names (created in Step 2)</li>
-      <li><code>PARSE_QUEUE_NAME</code> / <code>SEND_QUEUE_NAME</code> in <code>[vars]</code> → must match queue names above</li>
-    </ul>
-    The repository's <code>wrangler.toml</code> contains example values; replace <code>account_id</code> with yours before deploying. Other fields can be customized as needed.
-  </div>
-  <div class="tip tip-warn">Before deploying, obtain from your log ingestion partner: server endpoint URL, authentication private key, and the target URI path.</div>
+  <div class="tip tip-warn"><strong>This template is deployed once per domain.</strong> Replace the per-domain identifiers in <code>wrangler.toml</code> (marked <span class="must">【按域名修改 / per-domain】</span> inline). See the <a href="#config" style="color:var(--orange)">Configuration</a> checklist below.</div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">1</div><h3>Create R2 Bucket</h3></div>
+    <div class="step-card-header"><div class="snum">1</div><h3>Create the R2 Bucket</h3></div>
     <div class="step-card-body">
       <p><strong>Dashboard → R2 Object Storage → Create bucket</strong></p>
-      <ul>
-        <li>Name: <code>cdn-logs-raw</code></li>
-        <li>Location: Automatic (default)</li>
-      </ul>
+      <ul><li>Name: <code>&lt;domain&gt;-com</code> (must match <code>bucket_name</code> and <code>[vars].R2_BUCKET_NAME</code>)</li><li>Location: Automatic</li></ul>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">2</div><h3>Create Queues</h3></div>
+    <div class="step-card-header"><div class="snum">2</div><h3>Create the Queues</h3></div>
     <div class="step-card-body">
-      <p><strong>Dashboard → Workers &amp; Pages → Queues → Create queue</strong></p>
-      <p>Create all four queues (exact names required):</p>
+      <p><strong>Dashboard → Workers &amp; Pages → Queues → Create queue</strong> — create all four:</p>
       <table>
-        <tr><th>Queue Name</th><th>Purpose</th></tr>
-        <tr><td><code>parse-queue</code></td><td>Triggers Parser Worker on new R2 files</td></tr>
-        <tr><td><code>send-queue</code></td><td>Triggers Sender Worker on processed batches</td></tr>
-        <tr><td><code>parse-dlq</code></td><td>Dead-letter queue for parse failures — auto-consumed by the Worker and re-driven back to parse-queue</td></tr>
-        <tr><td><code>send-dlq</code></td><td>Dead-letter queue for send failures — auto-consumed by the Worker and re-driven back to send-queue</td></tr>
+        <tr><th>Queue</th><th>Purpose</th></tr>
+        <tr><td><code>parse-queue-&lt;domain&gt;</code></td><td>Triggers the Parser on each new R2 file</td></tr>
+        <tr><td><code>send-queue-&lt;domain&gt;</code></td><td>Triggers the Sender on each processed batch</td></tr>
+        <tr><td><code>parse-dlq-&lt;domain&gt;</code></td><td>Dead letters for parse — auto-consumed and re-driven back to parse-queue</td></tr>
+        <tr><td><code>send-dlq-&lt;domain&gt;</code></td><td>Dead letters for send — auto-consumed and re-driven back to send-queue</td></tr>
       </table>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">3</div><h3>Configure R2 Event Notification</h3></div>
+    <div class="step-card-header"><div class="snum">3</div><h3>Configure the R2 Event Notification</h3></div>
     <div class="step-card-body">
-      <p><strong>R2 → cdn-logs-raw → Settings → Event Notifications → Add notification</strong></p>
+      <p><strong>R2 → &lt;domain&gt;-com → Settings → Event Notifications → Add notification</strong></p>
       <ul>
         <li>Event type: <code>object-create</code></li>
-        <li>Queue: <code>parse-queue</code></li>
-        <li>Prefix: <code>logs/</code> (required; do not notify on the full bucket)</li>
+        <li>Queue: <code>parse-queue-&lt;domain&gt;</code></li>
+        <li>Prefix: <code>logs/</code> (required — do not notify on the full bucket)</li>
         <li>Suffix (optional): <code>.gz</code></li>
       </ul>
     </div>
@@ -681,346 +416,147 @@ Lines 4001–4500 → processed/xxx-2.txt ( 500 lines) + send-queue message</pre
   <div class="step-card">
     <div class="step-card-header"><div class="snum">4</div><h3>Set Worker Secrets</h3></div>
     <div class="step-card-body">
-      <p>From the project directory, set encrypted secrets via Wrangler:</p>
-      <pre><span class="comment"># Log ingestion endpoint (base URL, no trailing slash)</span>
+      <pre><span class="comment"># Ingestion endpoint (base URL, no trailing slash)</span>
 wrangler secret put CTYUN_ENDPOINT
 
 <span class="comment"># Authentication private key</span>
 wrangler secret put CTYUN_PRIVATE_KEY
 
 <span class="comment"># Target URI path (e.g. /logpost/yourpath)</span>
-wrangler secret put CTYUN_URI_EDGE
-
-<span class="comment"># Verify</span>
-wrangler secret list</pre>
-      <div class="tip tip-info">If using GitHub Actions CI/CD, secrets still need to be set via <code>wrangler secret put</code> directly. They persist in Cloudflare and do not need to be re-uploaded on each deployment.</div>
+wrangler secret put CTYUN_URI_EDGE</pre>
+      <div class="tip tip-info">Secrets are set once and persist in Cloudflare; they are not re-uploaded on each deploy.</div>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">5</div><h3>Deploy the Worker</h3></div>
+    <div class="step-card-header"><div class="snum">5</div><h3>Deploy</h3></div>
     <div class="step-card-body">
-      <pre>wrangler deploy</pre>
-      <div class="tip tip-success">Expected output confirms: Producer bindings for parse-queue and send-queue. Consumer bindings for parse-queue and send-queue. Current Version ID assigned.</div>
-      <div class="tip tip-warn">If deploying via GitHub Actions, simply push to the <code>main</code> branch. The workflow handles <code>wrangler deploy</code> automatically.</div>
+      <pre>wrangler deploy        <span class="comment"># or: push to main → GitHub Actions runs it</span></pre>
+      <div class="tip tip-success">Expected output confirms producer + consumer bindings for parse-queue and send-queue, and a new Version ID.</div>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">6</div><h3>Configure Logpush Job</h3></div>
+    <div class="step-card-header"><div class="snum">6</div><h3>Configure the Logpush Job</h3></div>
     <div class="step-card-body">
-      <p><strong>Dashboard → [Target Zone] → Analytics &amp; Logs → Logpush → Create a Logpush job</strong></p>
+      <p><strong>Dashboard → [Zone] → Analytics &amp; Logs → Logpush → Create a Logpush job</strong></p>
       <ol>
-        <li>Destination: <strong>R2</strong></li>
-        <li>Bucket: <code>cdn-logs-raw</code> &nbsp;·&nbsp; Path prefix: <code>logs/{DATE}/</code></li>
+        <li>Destination: <strong>R2</strong> &nbsp;·&nbsp; Bucket: <code>&lt;domain&gt;-com</code> &nbsp;·&nbsp; Path prefix: <code>logs/{DATE}/</code></li>
         <li>Dataset: <strong>HTTP requests</strong></li>
-        <li>Fields: <strong>Select all fields</strong> (the Worker handles missing fields gracefully)</li>
-        <li>Timestamp format: <strong>Unix</strong></li>
-        <li>Sample rate: <code>1</code> (100%)</li>
+        <li>Fields: <strong>Select all</strong> (the Worker handles missing fields gracefully)</li>
+        <li>Timestamp format: <strong>Unix</strong> &nbsp;·&nbsp; Sample rate: <code>1</code> (100%)</li>
       </ol>
-      <div class="tip tip-warn">Timestamp format must be set to <strong>Unix</strong>. The parser auto-detects all three formats but Unix is recommended for consistency.</div>
     </div>
   </div>
 
   <div class="step-card">
     <div class="step-card-header"><div class="snum" style="background:#888">6b</div><h3>Enable Content-Length Logging <span style="font-weight:400; font-size:13px; color:#aaa;">— Optional</span></h3></div>
     <div class="step-card-body">
-      <p>By default, field #21 (<code>sent_http_content_length</code>) falls back to <code>EdgeResponseBodyBytes</code>. To capture the true <code>Content-Length</code> response header value, configure Logpush Custom Fields via API. This is a one-time zone-level configuration.</p>
-      <div class="tip tip-warn">This configuration requires API access. It cannot be set through the Cloudflare Dashboard UI.</div>
-
-      <h4>Step A — Check for existing Custom Fields ruleset</h4>
-      <pre><span class="comment"># List zone rulesets and find http_log_custom_fields phase</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
-  --request GET \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  | jq '.result[] | select(.phase == "http_log_custom_fields") | {id, phase}'</pre>
-      <p>If a ruleset is returned, note its <code>id</code> as <code>RULESET_ID</code> and skip to Step C. If no result, proceed to Step B.</p>
-
-      <h4>Step B — Create the Custom Fields ruleset (only if Step A returned nothing)</h4>
-      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
-  --request POST \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "name": "Zone-level phase entry point",
-    "kind": "zone",
-    "description": "Custom log fields for Logpush",
-    "phase": "http_log_custom_fields"
-  }' | jq '.result.id'</pre>
-      <p>Note the returned <code>id</code> as <code>RULESET_ID</code>.</p>
-
-      <h4>Step C — Configure content-length capture</h4>
-      <p>Use <code>raw_response_fields</code> to capture the original <code>content-length</code> value from the origin before any CF transformations.</p>
-      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$RULESET_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "rules": [
-      {
-        "action": "log_custom_field",
-        "expression": "true",
-        "description": "Capture content-length response header for Logpush",
-        "action_parameters": {
-          "raw_response_fields": [
-            { "name": "content-length" }
-          ]
-        }
-      }
-    ]
-  }'</pre>
-
-      <h4>Step D — Add ResponseHeaders to the Logpush job</h4>
-      <pre><span class="comment"># Get your Logpush job ID first</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs" \
-  --request GET \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  | jq '.result[] | {id, name, dataset}'
-
-<span class="comment"># Update job to include ResponseHeaders field</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "output_options": {
-      "field_names": [
-        "CacheCacheStatus","ClientCountry","ClientIP","ClientRequestBytes",
-        "ClientRequestHost","ClientRequestMethod","ClientRequestProtocol",
-        "ClientRequestReferer","ClientRequestScheme","ClientRequestURI",
-        "ClientRequestUserAgent","ClientSSLProtocol","ClientSrcPort",
-        "EdgeColoCode","EdgeResponseBodyBytes","EdgeResponseBytes",
-        "EdgeResponseContentType","EdgeResponseStatus","EdgeServerIP",
-        "EdgeStartTimestamp","EdgeEndTimestamp","EdgeTimeToFirstByteMs","OriginIP",
-        "OriginRequestHeaderSendDurationMs","OriginResponseDurationMs",
-        "OriginResponseHeaderReceiveDurationMs","OriginResponseStatus",
-        "OriginTLSHandshakeDurationMs","ParentRayID","RayID",
-        "ResponseHeaders"
-      ],
-      "timestamp_format": "unix"
-    }
-  }'</pre>
-      <div class="tip tip-success">Once configured, <code>ResponseHeaders</code> in each log line will contain <code>{"content-length": "12345"}</code> and the Worker will automatically use it for field #21.</div>
-      <div class="tip tip-info">Note: For HTTP/2 responses or gzip-compressed responses, CF may omit <code>Content-Length</code> and use chunked transfer encoding instead. In those cases field #21 will output <code>-</code>.</div>
+      <p>To populate field #21 from the true <code>Content-Length</code> response header, configure Logpush Custom Fields via API (a one-time, zone-level setup; not available in the Dashboard UI). Add a <code>http_log_custom_fields</code> ruleset that captures <code>content-length</code>, then include <code>ResponseHeaders</code> in the Logpush job's field list. Without it, field #21 outputs <code>-</code>.</p>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">7</div><h3>Verify End-to-End</h3></div>
+    <div class="step-card-header"><div class="snum">7</div><h3>Verify End to End</h3></div>
     <div class="step-card-body">
-      <p>Allow ~2 minutes for Logpush to initialize and write the first batch, then verify:</p>
+      <p>Allow ~2 minutes, then check:</p>
       <ol>
-        <li><strong>R2:</strong> <code>cdn-logs-raw/logs/</code> contains <code>.log.gz</code> files</li>
-        <li><strong>Queue:</strong> <code>parse-queue</code> → Messages Processed counter is incrementing</li>
-        <li><strong>Worker logs:</strong> Real-time tail via <code>wrangler tail ctyun-logpush</code></li>
+        <li><strong>R2:</strong> <code>&lt;domain&gt;-com/logs/</code> contains <code>.log.gz</code> files</li>
+        <li><strong>Queues:</strong> parse-queue / send-queue "Messages Processed" is incrementing; DLQs near 0</li>
+        <li><strong>Worker logs:</strong> <code>wrangler tail</code></li>
       </ol>
-      <pre><span class="comment"># Expected log output (LOG_LEVEL=info)</span>
+      <pre><span class="comment"># Expected (LOG_LEVEL=info)</span>
 [INFO] Parsing: logs/20260328/xxx.log.gz
-[INFO] Done: logs/20260328/xxx.log.gz | lines=73 batches=1 errors=0
-[INFO] Sent 73 lines → HTTP 200 | processed/xxx.txt</pre>
-      <div class="tip tip-error">HTTP 401/403 on send → verify CTYUN_PRIVATE_KEY value</div>
-      <div class="tip tip-error">HTTP 404 on send → verify CTYUN_URI_EDGE path</div>
+[INFO] Done: logs/20260328/xxx.log.gz | lines=73 batches=1 errors=0 ...
+[INFO] Sent 73 ... → HTTP 200 | processed/xxx.txt</pre>
+      <div class="tip tip-error">HTTP 401/403 on send → check <code>CTYUN_PRIVATE_KEY</code>. &nbsp; HTTP 404 → check <code>CTYUN_URI_EDGE</code>.</div>
     </div>
   </div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="config">
-  <div class="section-title"><div class="num">7</div>Configuration Reference</div>
+  <div class="section-title"><div class="num">5</div>Configuration</div>
 
-  <h3>wrangler.toml</h3>
-  <pre><span class="key">name</span>                = <span class="str">"ctyun-logpush"</span>
-<span class="key">main</span>                = <span class="str">"src/index.js"</span>
-<span class="key">compatibility_date</span>  = <span class="str">"2026-03-27"</span>
-<span class="key">compatibility_flags</span> = [<span class="str">"nodejs_compat"</span>]
-<span class="key">account_id</span>          = <span class="str">"&lt;your-account-id&gt;"</span>
-
-[[r2_buckets]]
-<span class="key">binding</span>     = <span class="str">"RAW_BUCKET"</span>
-<span class="key">bucket_name</span> = <span class="str">"cdn-logs-raw"</span>
-
-[[queues.producers]]
-<span class="key">binding</span> = <span class="str">"PARSE_QUEUE"</span>
-<span class="key">queue</span>   = <span class="str">"parse-queue"</span>
-
-[[queues.producers]]
-<span class="key">binding</span> = <span class="str">"SEND_QUEUE"</span>
-<span class="key">queue</span>   = <span class="str">"send-queue"</span>
-
-[[queues.consumers]]
-<span class="key">queue</span>              = <span class="str">"parse-queue"</span>
-<span class="key">max_batch_size</span>     = 1     <span class="comment"># one file per invocation → bounded memory &amp; CPU</span>
-<span class="key">max_batch_timeout</span>  = 5
-<span class="key">max_retries</span>        = 5
-<span class="key">dead_letter_queue</span>  = <span class="str">"parse-dlq"</span>
-
-[[queues.consumers]]
-<span class="key">queue</span>              = <span class="str">"send-queue"</span>
-<span class="key">max_batch_size</span>     = 50
-<span class="key">max_batch_timeout</span>  = 5
-<span class="key">max_retries</span>        = 5
-<span class="key">dead_letter_queue</span>  = <span class="str">"send-dlq"</span>
-<span class="comment"># max_concurrency intentionally unset on both main queues: autoscale up to per-queue cap (250)</span>
-
-<span class="comment"># DLQ consumers — the same Worker re-drives dead-lettered messages back to the source queue</span>
-[[queues.consumers]]
-<span class="key">queue</span>           = <span class="str">"parse-dlq"</span>
-<span class="key">max_batch_size</span>  = 10
-<span class="key">max_retries</span>     = 10
-<span class="key">max_concurrency</span> = 1
-
-[[queues.consumers]]
-<span class="key">queue</span>           = <span class="str">"send-dlq"</span>
-<span class="key">max_batch_size</span>  = 10
-<span class="key">max_retries</span>     = 10
-<span class="key">max_concurrency</span> = 1
-
-[vars]
-<span class="key">BATCH_SIZE</span>            = <span class="str">"2000"</span>    <span class="comment"># lines per HTTP POST batch (1–2000)</span>
-<span class="key">RAW_LOG_PREFIX</span>        = <span class="str">"logs/"</span>   <span class="comment"># raw Logpush object prefix</span>
-<span class="key">RAW_LOG_SUFFIX</span>        = <span class="str">".log.gz"</span> <span class="comment"># raw Logpush object suffix</span>
-<span class="key">LOG_LEVEL</span>             = <span class="str">"info"</span>    <span class="comment"># debug | info | warn | error</span>
-<span class="key">SEND_PARALLELISM</span>      = <span class="str">"2"</span>       <span class="comment"># parallel POSTs within one send invocation</span>
-<span class="key">SEND_FETCH_TIMEOUT_MS</span> = <span class="str">"120000"</span>  <span class="comment"># per-POST abort timeout (ms)</span>
-<span class="key">RETRY_DELAY_SECONDS</span>   = <span class="str">"30"</span>      <span class="comment"># delay before retrying a failed message</span>
-<span class="key">REDRIVE_BASE_DELAY_SECONDS</span> = <span class="str">"60"</span>   <span class="comment"># DLQ re-drive backoff base</span>
-<span class="key">REDRIVE_MAX_DELAY_SECONDS</span>  = <span class="str">"3600"</span> <span class="comment"># DLQ re-drive backoff cap</span>
-<span class="key">REDRIVE_JITTER_SECONDS</span>     = <span class="str">"30"</span>   <span class="comment"># DLQ re-drive jitter</span>
-
-[limits]
-<span class="key">cpu_ms</span> = 300000   <span class="comment"># Enterprise max (5 min); large CPU headroom for big files</span>
-
-<span class="comment"># [triggers] crons = ["* * * * *"] — drives the scheduled() reconciliation sweep (safety net for late/dropped notifications)</span>
-<span class="comment"># workers_dev is a top-level wrangler.toml key, not [vars]</span></pre>
+  <h3>Per-Domain Checklist <span style="font-weight:400;font-size:13px;color:#aaa;">— the only values to change per deployment</span></h3>
+  <table>
+    <tr><th>In <code>wrangler.toml</code></th><th class="must">Set to</th></tr>
+    <tr><td><code>name</code></td><td><code>&lt;domain&gt;-com-log</code></td></tr>
+    <tr><td><code>account_id</code></td><td>the Cloudflare account ID the domain lives in</td></tr>
+    <tr><td>R2 <code>bucket_name</code> + <code>[vars].R2_BUCKET_NAME</code></td><td><code>&lt;domain&gt;-com</code> (must match)</td></tr>
+    <tr><td>Queue names — 2 producers, 4 consumers, and the 4 <code>[vars]</code> <code>*_QUEUE_NAME</code> / <code>*_DLQ_NAME</code></td><td><code>parse-queue-&lt;domain&gt;</code>, <code>send-queue-&lt;domain&gt;</code>, <code>parse-dlq-&lt;domain&gt;</code>, <code>send-dlq-&lt;domain&gt;</code> (keep all references consistent)</td></tr>
+    <tr><td><code>[vars].FIELD11_SERVER_IP</code></td><td><span class="must">Required.</span> The domain's anycast / resolved IP (e.g. <code>172.65.90.64</code>), written into field #11 <code>server_ip</code>. Empty → field #11 is <code>-</code>.</td></tr>
+  </table>
+  <p>Everything else carries a sensible default; normally you change only the rows above.</p>
 
   <h3>Environment Variables</h3>
   <table class="env-table">
-    <tr><th>Name</th><th>Type</th><th>Example</th><th>Description</th></tr>
-    <tr>
-      <td>CTYUN_ENDPOINT</td><td>Secret</td>
-      <td>http://log.example.com:5580</td>
-      <td>Log ingestion server base URL (no trailing slash, no URI path)</td>
-    </tr>
-    <tr>
-      <td>CTYUN_PRIVATE_KEY</td><td>Secret</td>
-      <td>YourKey@1234</td>
-      <td>MD5 authentication private key (provided by log partner)</td>
-    </tr>
-    <tr>
-      <td>CTYUN_URI_EDGE</td><td>Secret</td>
-      <td>/logpost/yourpath</td>
-      <td>Target URI path for HTTP POST (provided by log partner)</td>
-    </tr>
-    <tr>
-      <td>R2_BUCKET_NAME</td><td>Var</td>
-      <td>cdn-logs-raw</td>
-      <td>R2 bucket name. <strong>Must match</strong> <code>[[r2_buckets]] bucket_name</code> above.</td>
-    </tr>
-    <tr>
-      <td>BATCH_SIZE</td><td>Var</td>
-      <td>2000</td>
-      <td>Number of log lines per POST batch. The Worker validates this as an integer from 1 to 2000.</td>
-    </tr>
-    <tr>
-      <td>RAW_LOG_PREFIX / RAW_LOG_SUFFIX</td><td>Var</td>
-      <td>logs/ / .log.gz</td>
-      <td>Allowlist for raw Logpush objects. Non-matching R2 notifications are acknowledged and skipped.</td>
-    </tr>
-    <tr>
-      <td>LOG_LEVEL</td><td>Var</td>
-      <td>info</td>
-      <td>Worker log verbosity. Use <code>debug</code> for troubleshooting; revert to <code>info</code> in production.</td>
-    </tr>
-    <tr>
-      <td>SEND_FETCH_TIMEOUT_MS</td><td>Var</td>
-      <td>120000</td>
-      <td>Per-POST abort timeout in milliseconds (range 1000–120000). A stalled receiver is aborted and the message falls back to queue retry, preventing a single invocation from holding open against the 15-minute consumer wall-time limit.</td>
-    </tr>
-    <tr>
-      <td>SEND_PARALLELISM</td><td>Var</td>
-      <td>2</td>
-      <td>Parallel POSTs within a single send invocation (1 = serial; soft cap 8).</td>
-    </tr>
-    <tr>
-      <td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>Var</td>
-      <td>60 / 3600 / 30</td>
-      <td>DLQ re-drive delay — exponential-backoff base, cap, and random jitter (seconds) used when re-enqueuing dead-lettered messages to their source queue.</td>
-    </tr>
+    <tr><th>Name</th><th>Default</th><th>Description</th></tr>
+    <tr><td>CTYUN_ENDPOINT</td><td><em>secret</em></td><td>Ingestion server base URL (no trailing slash, no URI path)</td></tr>
+    <tr><td>CTYUN_PRIVATE_KEY</td><td><em>secret</em></td><td>MD5 authentication private key (from the log partner)</td></tr>
+    <tr><td>CTYUN_URI_EDGE</td><td><em>secret</em></td><td>Target URI path for the HTTP POST (from the log partner)</td></tr>
+    <tr><td>FIELD11_SERVER_IP</td><td><span class="must">""  (required)</span></td><td>The domain's anycast / resolved IP for field #11; empty outputs <code>-</code></td></tr>
+    <tr><td>BATCH_SIZE</td><td>2000</td><td>Log lines per POST batch (1–2000). Clear the DLQs before changing it.</td></tr>
+    <tr><td>PARSE_PARALLELISM</td><td>2</td><td>Files parsed in parallel within one parse invocation (≤ parse <code>max_batch_size</code>; cap 8)</td></tr>
+    <tr><td>PARSE_READ_IDLE_TIMEOUT_MS</td><td>45000</td><td>Per-read idle timeout (ms); a stalled read aborts and retries just that file. 0 = off</td></tr>
+    <tr><td>SEND_PARALLELISM</td><td>2</td><td>Parallel POSTs within one send invocation (1 = serial; cap 8)</td></tr>
+    <tr><td>SEND_FETCH_TIMEOUT_MS</td><td>30000</td><td>Per-POST abort timeout (ms) for a stalled receiver</td></tr>
+    <tr><td>RETRY_DELAY_SECONDS</td><td>30</td><td>Delay before retrying a failed parse/send message</td></tr>
+    <tr><td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>60 / 3600 / 30</td><td>DLQ re-drive exponential-backoff base, cap, and jitter (seconds)</td></tr>
+    <tr><td>RAW_LOG_PREFIX / RAW_LOG_SUFFIX</td><td>logs/ / .log.gz</td><td>Allowlist for raw Logpush objects; non-matching notifications are acknowledged and skipped</td></tr>
+    <tr><td>PUSH_START_TIME</td><td>""</td><td>Empty = push all new logs. A future time = start pushing at that time. A past time = scan R2 and backfill from then (ISO 8601)</td></tr>
+    <tr><td>LOG_LEVEL</td><td>info</td><td>debug | info | warn | error</td></tr>
   </table>
 
-  <div class="tip tip-info">Secrets are set once via <code>wrangler secret put &lt;NAME&gt;</code> and persist in Cloudflare. They are never stored in <code>wrangler.toml</code> or committed to source control.</div>
+  <h3>Consumer &amp; Limits Settings</h3>
+  <table>
+    <tr><th>Setting</th><th>Value</th><th>Notes</th></tr>
+    <tr><td>parse-queue</td><td>max_batch_size 2 · timeout 5s · retries 5 → parse-dlq</td><td>Bounded pool; <code>max_concurrency</code> unset (autoscale, cap 250)</td></tr>
+    <tr><td>send-queue</td><td>max_batch_size 50 · timeout 5s · retries 5 → send-dlq</td><td><code>max_concurrency</code> unset (autoscale, cap 250)</td></tr>
+    <tr><td>parse-dlq / send-dlq</td><td>max_batch_size 10 · timeout 30s · retries 10 · concurrency 1</td><td>Re-drive consumers; gentle drain, no own DLQ</td></tr>
+    <tr><td><code>[limits].cpu_ms</code></td><td>300000</td><td>Enterprise max (5 min); large headroom</td></tr>
+    <tr><td><code>[triggers].crons</code></td><td><code>"* * * * *"</code></td><td>Drives the scheduled handler; only acts when <code>PUSH_START_TIME</code> is a past time, otherwise returns immediately</td></tr>
+  </table>
 
-  <h3>GitHub Actions CI/CD</h3>
-  <p>The repository includes <code>.github/workflows/deploy.yml</code>. Any push to <code>main</code> triggers an automatic <code>wrangler deploy</code> (code and configuration only).</p>
-  <p>Required GitHub secret for CI/CD: <code>CLOUDFLARE_API_TOKEN</code> only. Worker secrets (<code>CTYUN_ENDPOINT</code>, <code>CTYUN_PRIVATE_KEY</code>, <code>CTYUN_URI_EDGE</code>) are managed separately via <code>wrangler secret put</code>.</p>
+  <div class="tip tip-info">Secrets are set with <code>wrangler secret put &lt;NAME&gt;</code> and never stored in <code>wrangler.toml</code>. For GitHub Actions, the only required repository secret is <code>CLOUDFLARE_API_TOKEN</code>; a push to <code>main</code> runs <code>wrangler deploy</code>.</div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="ops">
-  <div class="section-title"><div class="num">8</div>Operations</div>
+  <div class="section-title"><div class="num">6</div>Operations</div>
 
-  <h3>Health Check — Dashboard Indicators</h3>
+  <h3>Health Indicators</h3>
   <table>
-    <tr><th>Indicator</th><th>Healthy State</th><th>Action if Abnormal</th></tr>
-    <tr><td>R2 <code>logs/</code></td><td>New <code>.gz</code> files appearing every ~1 min</td><td>Check Logpush job is Enabled</td></tr>
-    <tr><td>parse-queue backlog</td><td>Near 0 at all times</td><td>Sustained backlog → check Worker logs for parse errors</td></tr>
-    <tr><td>send-queue backlog</td><td>Near 0 at all times</td><td>Sustained backlog → check remote endpoint availability</td></tr>
-    <tr><td>parse-dlq / send-dlq</td><td>Near 0 (auto-drained)</td><td>The Worker auto-re-drives DLQ messages back to the source queue; only a <em>persistently growing</em> DLQ needs attention (a genuinely unprocessable file or a down endpoint)</td></tr>
-    <tr><td>R2 <code>processed/</code></td><td>No file accumulation</td><td>Files accumulating → Sender not consuming; check Worker logs</td></tr>
+    <tr><th>Indicator</th><th>Healthy</th><th>If Abnormal</th></tr>
+    <tr><td>R2 <code>logs/</code></td><td>New <code>.gz</code> files every ~1 min</td><td>Check the Logpush job is enabled</td></tr>
+    <tr><td>parse-queue / send-queue backlog</td><td>Low and stable</td><td>Sustained growth → check Worker logs / endpoint availability</td></tr>
+    <tr><td>parse-dlq / send-dlq</td><td>Near 0 (auto-drained)</td><td>Only a <em>persistently growing</em> DLQ needs attention (an unprocessable file or a down endpoint)</td></tr>
+    <tr><td>R2 <code>processed/</code></td><td>No accumulation</td><td>Files piling up → Sender not consuming; check Worker logs</td></tr>
   </table>
 
-  <h3>Metric Interpretation Guide</h3>
+  <h3>Reading the Metrics</h3>
   <table>
     <tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
-    <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>System consuming in real time</td><td>Healthy — no action needed</td></tr>
-    <tr><td>Backlog growing continuously</td><td>Consumption falling behind production — genuine bottleneck</td><td>Check Worker errors; scale if needed</td></tr>
-    <tr><td><code>exceededResources</code> &gt; 0 (Dashboard "Exceeded CPU")</td><td>A per-invocation resource ceiling was hit. <code>max_batch_size = 1</code> (one file per invocation) and <code>cpu_ms = 300000</code> keep large headroom; check actual <code>cpuTimeP999</code> via GraphQL to see how close it runs</td><td>Messages that dead-letter are auto-re-driven; if a domain consistently runs near the limit on very large files, raise its <code>cpu_ms</code> (Enterprise max 300000)</td></tr>
-    <tr><td>Messages Retried &gt; 0</td><td>Partner endpoint instability</td><td>Investigate 5xx subrequests; confirm endpoint capacity</td></tr>
-    <tr><td>DLQ &gt; 0 (transient)</td><td>Normal during a transient blip — the Worker re-drives automatically</td><td>No action for a DLQ that drains itself; investigate only if it grows persistently (unprocessable file / down endpoint)</td></tr>
-    <tr><td>send-queue backlog growing</td><td>Receiver is slow or unavailable, or <code>max_concurrency</code> was manually capped low</td><td>Check endpoint latency/errors; verify <code>max_concurrency</code> is unset (autoscale recommended)</td></tr>
+    <tr><td>Backlog low + lag &lt; 30s</td><td>Consuming in real time</td><td>Healthy — no action</td></tr>
+    <tr><td>Backlog growing continuously</td><td>Consumption falling behind production</td><td>Check Worker errors and endpoint latency</td></tr>
+    <tr><td>DLQ &gt; 0 but draining</td><td>Transient failure being re-driven automatically</td><td>No action</td></tr>
+    <tr><td>DLQ growing persistently</td><td>An unprocessable file or a down endpoint</td><td>Inspect the dead-lettered message / endpoint</td></tr>
+    <tr><td>send-queue backlog growing</td><td>Receiver slow/unavailable, or <code>max_concurrency</code> capped low</td><td>Check endpoint; verify <code>max_concurrency</code> is unset</td></tr>
   </table>
 
-  <h3>Updating Secrets vs. Variables</h3>
+  <h3>Changing Settings</h3>
   <table>
-    <tr><th>Change Type</th><th>Method</th><th>Redeploy Required?</th></tr>
-    <tr><td>Rotate CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE</td><td><code>wrangler secret put &lt;NAME&gt;</code></td><td>No — effective immediately</td></tr>
-    <tr><td>Change BATCH_SIZE / RAW_LOG_PREFIX / RAW_LOG_SUFFIX / LOG_LEVEL / timeouts / re-drive delays</td><td>Edit <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>Yes</td></tr>
-    <tr><td>Update Worker code (<code>src/index.js</code>)</td><td><code>git push</code> → CI/CD auto-deploys</td><td>Yes (handled by CI/CD)</td></tr>
-  </table>
-
-  <h3>Design Rationale &amp; Tuning (Why These Settings)</h3>
-  <p>The basis below was distilled from a full 2026-06 review of all 261 domains across both accounts. It is kept here (not in <code>wrangler.toml</code>) so maintainers can understand each value; day-to-day deployment only needs the PER-DOMAIN CHECKLIST at the top of <code>wrangler.toml</code>, with parameters left at their defaults.</p>
-  <table>
-    <tr><th>Scenario / Symptom</th><th>Observed</th><th>Resulting Setting</th></tr>
-    <tr>
-      <td>Memory OOM (<code>exceededMemory</code>, confirmed)</td>
-      <td>Large-line domains (e.g. id-upload / id-update, ~4KB per line) under the old parallel batch parsing: peak memory = batch × multiple copies, multiple invocations sharing one isolate → over 128MB.</td>
-      <td><code>max_batch_size = 1</code>: parse one file per invocation, cutting per-invocation memory / CPU / subrequests to ~1/3.</td>
-    </tr>
-    <tr>
-      <td>Large-file / resource-heavy</td>
-      <td>Domains like asia-vcode-od / img / magazine have single files of 70k–100k lines (~290MB), CPU-heavy (success cpuTime P99 ≈ 29–31s, ~6× id-upload). That DLQ batch was a one-time event on 2026-06-02~05 (peak 6/3), now settled. <strong>Exact trigger never pinned down</strong>: the measured <code>exceededResources</code> cpuTime was only 35–38s (under 60s), wall &lt; 900s, subrequests &lt; 1000 — none hit a known hard limit; observability was sampled and metrics have aged out. So the settings below are <strong>risk reduction</strong>, not a proven sole root cause.</td>
-      <td><code>max_batch_size = 1</code> + <code>cpu_ms = 300000</code> (Enterprise max): large headroom for any single-invocation resource.</td>
-    </tr>
-    <tr>
-      <td>Concurrency &amp; throughput</td>
-      <td>The big domain (asia-vcode-od) needs ~200 send-concurrency to forward in real time; the Queues concurrency cap is <strong>250 per queue</strong> (per docs); after batch=1, parse needs ~42 concurrency, within parse-queue's own 250 and not competing with send.</td>
-      <td>Both main queues <strong>deliberately leave <code>max_concurrency</code> unset</strong> (autoscaler); DLQ consumers use <code>max_concurrency = 1</code> (small dead-letter volume, gentle drain).</td>
-    </tr>
-    <tr>
-      <td>cron trigger / handler mismatch</td>
-      <td>Historical lesson: the script was once made "purely event-driven" and the <code>scheduled</code> handler removed, but a leftover <code>* * * * *</code> trigger kept firing every minute → hit a non-existent handler → per-minute <code>scriptThrewException</code> (reproduced 2026-06).</td>
-      <td>The current design restores the reconciliation sweep: <code>scheduled()</code> is a real handler wrapped entirely in <code>try/catch</code> (never throws), paired with <code>[triggers] crons = ["* * * * *"]</code>. Rule: trigger and handler must match — if a cron exists, a non-throwing handler must exist too.</td>
-    </tr>
-    <tr>
-      <td>Field #11 server_ip</td>
-      <td>CF's <code>EdgeServerIP</code> is the edge→origin internal IP — populated only on origin-bound requests, empty on cache hits — not the public-facing service IP, and inconsistent with the customer-validated format (a fixed anycast VIP).</td>
-      <td>Field #11 uses <code>FIELD11_SERVER_IP</code> (the domain's resolved / anycast IP filled in wrangler; semantics = nginx <code>$server_addr</code>); <strong>required</strong>, emitted as <code>-</code> if empty.</td>
-    </tr>
+    <tr><th>Change</th><th>How</th><th>Redeploy?</th></tr>
+    <tr><td>Rotate a secret</td><td><code>wrangler secret put &lt;NAME&gt;</code></td><td>No — effective immediately</td></tr>
+    <tr><td>Change a <code>[vars]</code> value or consumer setting</td><td>Edit <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>Yes</td></tr>
+    <tr><td>Update Worker code</td><td><code>git push</code> → GitHub Actions deploys</td><td>Yes (automatic)</td></tr>
   </table>
 </section>
 
 </div>
 
 <footer>
-  Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN Log Integration Reference &nbsp;·&nbsp; 2026
+  Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN Log Integration Reference
   <br><a href="mailto:dong@cloudflare.com" style="color:#666; text-decoration:none;">dong@cloudflare.com</a>
 </footer>
 

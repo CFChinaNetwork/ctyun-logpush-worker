@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CF Logpush — 日志格式转换与自动推送指南</title>
+<title>CF 日志格式转换与自动推送指南</title>
 <style>
 :root {
   --orange: #f48120;
@@ -20,10 +20,10 @@
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   background: var(--dark);
   color: var(--text);
-  line-height: 1.75;
+  line-height: 1.8;
   font-size: 15px;
 }
 header {
@@ -39,12 +39,11 @@ header .badge {
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 2px;
-  text-transform: uppercase;
   padding: 4px 14px;
   border-radius: 20px;
   margin-bottom: 16px;
 }
-header h1 { font-size: 30px; font-weight: 800; margin-bottom: 10px; line-height: 1.3; }
+header h1 { font-size: 28px; font-weight: 800; margin-bottom: 10px; line-height: 1.3; }
 header h1 span { color: var(--orange); }
 header p { color: #888; font-size: 14px; margin-top: 6px; }
 nav {
@@ -112,7 +111,7 @@ p { margin-bottom: 10px; color: var(--text); }
   padding: 20px;
 }
 .info-card .icon { font-size: 26px; margin-bottom: 10px; }
-.info-card h4 { color: var(--orange); margin: 0 0 8px; font-size: 13px; }
+.info-card h4 { color: var(--orange); margin: 0 0 8px; font-size: 13px; letter-spacing: 0.5px; }
 .info-card p { font-size: 13px; color: #aaa; margin: 0; }
 .ascii-flow {
   background: var(--code-bg);
@@ -140,8 +139,6 @@ pre {
   margin: 10px 0 18px;
 }
 pre .comment { color: #6e7681; }
-pre .key { color: #79c0ff; }
-pre .str { color: #a8daab; }
 code {
   background: rgba(255,255,255,0.08);
   color: var(--orange);
@@ -202,8 +199,7 @@ th {
 td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
 tr:hover td { background: rgba(255,255,255,0.02); }
 .env-table td:first-child { color: #79c0ff; font-family: monospace; font-size: 12.5px; }
-.env-table td:nth-child(2) { color: #a8daab; }
-.stars { color: var(--yellow); letter-spacing: 2px; }
+.must { color: var(--yellow); font-weight: 700; }
 footer {
   text-align: center;
   padding: 28px;
@@ -211,467 +207,203 @@ footer {
   font-size: 12px;
   border-top: 1px solid var(--border);
 }
-ul, ol { padding-left: 20px; margin: 8px 0 14px; }
+ul, ol { padding-left: 22px; margin: 8px 0 14px; }
 li { margin: 5px 0; font-size: 14px; }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="badge">Cloudflare Enterprise — 技术参考文档</div>
-  <h1>CF Logpush — <span>日志格式转换</span>与自动推送</h1>
-  <p>无服务器日志管道 · Cloudflare Workers + R2 + Queues · CDN 合作方日志对接</p>
+  <div class="badge">Cloudflare Enterprise · 技术参考</div>
+  <h1>CF 日志<span>格式转换</span>与自动推送指南</h1>
+  <p>无服务器日志管线 · Cloudflare Workers + R2 + Queues · CDN 伙伴日志对接</p>
 </header>
 
 <nav>
-  <a href="#overview">方案概述</a>
-  <a href="#architecture">架构设计</a>
-  <a href="#design">核心决策</a>
-  <a href="#pipeline">流转机制</a>
-  <a href="#performance">性能指标</a>
-  <a href="#deploy">部署指南</a>
-  <a href="#config">配置参考</a>
-  <a href="#ops">日常运维</a>
+  <a href="#overview">概述</a>
+  <a href="#architecture">架构</a>
+  <a href="#how">工作原理</a>
+  <a href="#deploy">部署</a>
+  <a href="#config">配置</a>
+  <a href="#ops">运维</a>
 </nav>
 
 <div class="container">
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="overview">
-  <div class="section-title"><div class="num">1</div>方案概述</div>
+  <div class="section-title"><div class="num">1</div>概述</div>
 
   <div class="card-grid">
     <div class="info-card">
       <div class="icon">🎯</div>
       <h4>目标</h4>
-      <p>将 Cloudflare 边缘节点产生的 HTTP 访问日志（Logpush JSON 格式）自动转换为 CDN 合作方要求的自定义格式，并近实时推送到对方日志接收服务器。</p>
+      <p>将 Cloudflare 边缘访问日志从 Logpush 的 JSON 格式转换为 CDN 伙伴的 145 字段格式，并近实时推送到客户的日志接收端。</p>
     </div>
     <div class="info-card">
       <div class="icon">🏗️</div>
       <h4>技术栈</h4>
-      <p>全部基于 Cloudflare 原生服务：Logpush + R2 + Queues + Workers。无需服务器，无需运维，系统自动扩缩容。</p>
+      <p>100% Cloudflare 原生：Logpush + R2 + Queues + Workers。无服务器、无运维、按需自动扩容。</p>
     </div>
     <div class="info-card">
       <div class="icon">📋</div>
-      <h4>目标格式</h4>
-      <p>145 字段 <code>\u0001</code> 分隔纯文本格式，HTTP Body 需 Gzip 压缩，URL 签名采用 MD5 鉴权方式。</p>
+      <h4>日志格式</h4>
+      <p>145 字段，以 <code>\u0001</code> 分隔的纯文本；正文 gzip 压缩；通过 MD5 URL 签名鉴权。</p>
     </div>
     <div class="info-card">
       <div class="icon">⚡</div>
-      <h4>端到端延迟</h4>
-      <p>从请求产生到日志送达约 <strong style="color:var(--green)">70 秒</strong>，通常远优于合作方 SLA 要求（典型要求为 3 分钟内）。</p>
+      <h4>端到端时延</h4>
+      <p>约 <strong style="color:var(--green)">1–2 分钟</strong>（主要由 Logpush 约 1 分钟的攒批周期决定）。</p>
     </div>
   </div>
 
-  <h3>涉及的 Cloudflare 服务</h3>
+  <h3>使用到的 Cloudflare 服务</h3>
   <table>
     <tr><th>服务</th><th>作用</th><th>Dashboard 位置</th></tr>
-    <tr><td><strong>Logpush</strong></td><td>每约 1 分钟自动将边缘 HTTP 请求日志打包（ndjson.gz）写入 R2</td><td>域名 → Analytics &amp; Logs → Logpush</td></tr>
-    <tr><td><strong>R2 Object Storage</strong></td><td>存储原始日志文件及处理中的临时批次文件</td><td>Dashboard → R2 Object Storage</td></tr>
-    <tr><td><strong>R2 Event Notifications</strong></td><td>R2 每有新文件写入，立即触发 Queue 消息（秒级响应）</td><td>R2 Bucket → Settings → Event Notifications</td></tr>
-    <tr><td><strong>Queues</strong></td><td>解耦解析与发送两个阶段，保证 at-least-once 投递，自动重试</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
-    <tr><td><strong>Workers</strong></td><td>单脚本内包含两个逻辑 Worker：Parser（解析转换）和 Sender（签名推送）</td><td>通过 <code>wrangler deploy</code> 或 GitHub Actions 部署</td></tr>
+    <tr><td><strong>Logpush</strong></td><td>把边缘 HTTP 请求日志导出到 R2（约 1 分钟一批，gzip ndjson）</td><td>域名 → Analytics &amp; Logs → Logpush</td></tr>
+    <tr><td><strong>R2 对象存储</strong></td><td>存放原始日志文件与处理后的临时批次文件</td><td>Dashboard → R2 Object Storage</td></tr>
+    <tr><td><strong>R2 事件通知</strong></td><td>每个新写入的原始日志对象触发一条 Queue 消息</td><td>R2 桶 → Settings → Event Notifications</td></tr>
+    <tr><td><strong>Queues</strong></td><td>解耦解析与发送两段；at-least-once 投递，自动重试 + 死信队列</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
+    <tr><td><strong>Workers</strong></td><td>同一脚本三种角色：Parser、Sender、DLQ 重驱动</td><td>通过 <code>wrangler deploy</code> 或 GitHub Actions 部署</td></tr>
   </table>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="architecture">
-  <div class="section-title"><div class="num">2</div>架构设计</div>
+  <div class="section-title"><div class="num">2</div>架构</div>
 
-  <div class="ascii-flow">┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              【第一步】日志的产生                                      │
-│                                                                                     │
-│   用户打开网页 / App                                                                  │
-│          │                                                                           │
-│          ▼                                                                           │
-│   请求到达 Cloudflare 边缘节点（全球300+个城市）                                       │
-│          │                                                                           │
-│          │  CF 记录一条日志：用户IP、时间、URL、响应码、大小、缓存状态、耗时...          │
-│          ▼                                                                           │
-│   CF 边缘处理完请求，日志暂存在 CF 内部系统                                            │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                        每约1分钟，Logpush 自动打包推送
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                         【第二步】Logpush 自动推送日志到 R2                            │
-│                                                                                     │
-│   Logpush 服务（全自动，无需人工）：                                                   │
-│   1. 打包过去1分钟的所有日志（ndjson格式，每行一条JSON日志）                             │
-│   2. Gzip 压缩（大幅减小文件体积）                                                    │
-│   3. 写入 R2 存储桶                                                                  │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  R2 Bucket: cdn-logs-raw                │                                      │
-│   │  logs/                                  │                                      │
-│   │  └── 20260328/                          │ ← 按日期自动分目录                    │
-│   │      ├── 20260328T090000Z_xxx.log.gz    │ ← 每文件几KB到几MB                   │
-│   │      ├── 20260328T090100Z_xxx.log.gz    │ ← 文件名含时间戳，全球唯一            │
-│   │      └── ...（每分钟一个新文件）          │                                      │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                   R2 检测到新文件 → 立即触发（秒级）Event Notification
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     【第三步】R2 事件通知 → parse-queue 排队                           │
-│                                                                                     │
-│   R2 Event Notification 自动发送消息到 parse-queue：                                  │
-│   { "bucket": "cdn-logs-raw", "object": { "key": "logs/20260328/xxx.log.gz" } }     │
-│   （消息只有文件路径，几十字节，永远不超128KB限制）                                     │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  Queue: parse-queue（解析任务队列）       │                                      │
-│   │  消息1: { key: "logs/.../a.log.gz" }    │ ← 只是文件路径，不含日志内容           │
-│   │  消息2: { key: "logs/.../b.log.gz" }    │ ← 自动批量、自动重试、自动扩缩容       │
-│   │  ...                                     │                                      │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                       Queue 有消息时自动唤醒 Parser Worker（约3-5秒）
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                  【第四步】Parser Worker — 读取、解压、解析、格式转换                   │
-│                                                                                     │
-│   ① 从 R2 取得 .gz 文件流（不全量下载，只拿到流引用）                                  │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ② 实时解压（DecompressionStream）边读边解压，内存只有当前几KB数据                    │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ③ 按行切割，逐行解析 JSON（每行一条CF原始日志）                                      │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ④ 格式转换（transformEdge函数）                                                     │
-│      CF JSON → \u0001 分隔的145字段纯文本格式                                        │
-│                                                                                     │
-│      转换前：{ "RayID":"9e34...", "ClientIP":"221.229...", "EdgeColoCode":"HGH" }   │
-│      转换后：cs_vod_v3.0\u0001[28/Mar/2026:16:42:25 +0800]\u00019e34...\u0001200   │
-│             \u00011774680145.000\u00010.149\u0001...(共145字段)                     │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ⑤ 每累积2000条（或文件处理完）→ 写入 R2 临时文件 + 发消息到 send-queue              │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                              写入 R2 临时文件，发消息
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                    【第五步】R2 临时文件 + send-queue 排队                             │
-│                                                                                     │
-│   R2 临时文件（processed/ 目录，已转换为目标格式）：                                   │
-│   processed/logs_20260328_xxx-0.txt                ← 最多2000条日志，纯文本          │
-│                                                                                     │
-│   ┌─────────────────────────────────────────┐                                      │
-│   │  Queue: send-queue（发送任务队列）        │                                      │
-│   │  消息: { "key": "processed/...txt" }    │ ← 只传文件路径，几十字节               │
-│   │  ...                                     │ ← 发送失败自动重试5次，彻底失败进DLQ  │
-│   └─────────────────────────────────────────┘                                      │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                       Queue 有消息时自动唤醒 Sender Worker（约3-5秒）
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                   【第六步】Sender Worker — 压缩、签名、发送                           │
-│                                                                                     │
-│   ① 从 R2 读取临时文件（已转换好的最多2000条目标格式日志）                              │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ② Gzip 压缩 Body（合作方规范要求）                                                  │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ③ 计算 MD5 鉴权签名：                                                              │
-│      ts      = 当前Unix时间 + 300秒                                                  │
-│      rand    = 随机数                                                                │
-│      签名串  = "{uri}-{ts}-{rand}-{私钥}"                                            │
-│      md5hash = MD5(签名串)                                                          │
-│      URL     = {endpoint}{uri}?auth_key={ts}-{rand}-{md5}                          │
-│          │                                                                           │
-│          ▼                                                                           │
-│   ④ HTTP POST 发送到合作方日志接收服务器（Content-Encoding: gzip）                    │
-│          │                                                                           │
-│          ├── 成功(HTTP 200) → ack消息 + 删除R2临时文件 ✅                            │
-│          └── 失败 → retry → 最多5次 → 进 send-dlq → 自动回灌回 send-queue ↺        │
-└───────────────────────────────────────┬─────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           【第七步】合作方接收入库                                     │
-│   验证鉴权 → 解压Gzip → 按\u0001拆分145字段 → 写入计费/分析数据库 ✓                  │
-└─────────────────────────────────────────────────────────────────────────────────────┘</div>
+  <p>整条管线全程事件驱动。同一个 Worker 脚本消费全部 4 个队列：<code>parse-queue</code>（Parser）、<code>send-queue</code>（Sender）、<code>parse-dlq</code> / <code>send-dlq</code>（DLQ 重驱动）。下图标注了每一步对应的 <code>wrangler.toml</code> 参数。</p>
 
-  <div class="tip tip-info">Queue 消息中仅传递 R2 对象路径（数十字节），从不携带日志内容，彻底规避 Queue 128 KB 消息大小限制。</div>
+  <div class="ascii-flow">终端用户 ──▶ Cloudflare 边缘（300+ 城市）── 记录一条 http_requests 日志
+                          │
+                          ▼
+┌─ ① Logpush 任务 ─────────────────────────────────────────────────────────────┐
+│  按约 1 分钟攒批（ndjson），gzip 压缩后写入 R2。                                 │
+└──────────────────────────────┬────────────────────────────────────────────────┘
+                               ▼   R2 桶  &lt;domain&gt;-com
+                                   键: logs/YYYYMMDD/&lt;start&gt;_&lt;end&gt;_&lt;id&gt;.log.gz
+                          ┌──────┴───────────────────────────────────────────────┐
+                          │ R2 事件通知（object-create，前缀 logs/）             │
+                          │ → 每个新文件一条消息（仅含 key，&lt; 128 KB）           │
+                          ▼
+╔═ ② parse-queue-&lt;domain&gt; ══════════════════════════════════════════════════════╗
+║  max_batch_size 2 · max_batch_timeout 5s · max_retries 5 → parse-dlq           ║
+║  PARSE_PARALLELISM 2（单次 invocation 内并行解析的文件数）                      ║
+║  max_concurrency 不设 → 自动扩容（每队列上限 250）                             ║
+╚════════════════════════════════┬═══════════════════════════════════════════════╝
+                                 ▼   Parser（逐文件）：
+   1. 源级 .done 是否存在？  → ack 跳过              （幂等）
+   2. R2 get → 流式解压（gzip）；单次 read 空闲超时 45s
+      （读卡死则中断、只重试该文件）
+   3. 逐行转换 → 145 字段 \u0001 CDN 格式
+   4. 每 BATCH_SIZE(2000) 行 → 写 R2 processed/&lt;key&gt;-&lt;i&gt;.txt + 投 send-queue
+   5. 全部批次入队后 → 写源级 .done               （失败 → 重试 → parse-dlq）
+                                 ▼
+╔═ ③ send-queue-&lt;domain&gt; ═══════════════════════════════════════════════════════╗
+║  max_batch_size 50 · max_batch_timeout 5s · max_retries 5 → send-dlq           ║
+║  SEND_PARALLELISM 2（单次 invocation 内并行 POST 数）                           ║
+║  max_concurrency 不设 → 自动扩容（每队列上限 250）                             ║
+╚════════════════════════════════┬═══════════════════════════════════════════════╝
+                                 ▼   Sender（逐批次）：
+   1. 批次级 .done 是否存在？ → 跳过                （不重复 POST）
+   2. R2 get → 流式 gzip → POST 客户接收端
+      auth_key = ts-rand-md5(uri-ts-rand-privateKey)；第 11 字段 = FIELD11_SERVER_IP
+      单次 fetch 超时 SEND_FETCH_TIMEOUT_MS（30s）
+   3. HTTP 2xx → 写批次级 .done → 删 R2 临时文件     （失败 → 重试 → send-dlq）
+                                 ▼
+┌─ ④ 客户接收端 ────────────────────────────────────────────────────────────────┐
+│  校验鉴权 → 解 gzip → 按 \u0001 切分 → 入库。 必须支持 HTTP/1.1 chunked 请求体。 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+DLQ 自愈：parse-dlq / send-dlq 由同一 Worker 消费，按指数退避+抖动回灌源队列
+   （基数 60s、封顶 3600s、抖动 30s）。确定性 batchKey + .done 标记保证回灌不重复。</div>
+
+  <div class="tip tip-info">队列消息只携带 R2 对象 key（几十字节），不含日志正文 —— 远低于 128 KB 的消息上限。</div>
+  <div class="tip tip-warn">R2 事件通知只对原始对象配置：<code>object-create</code> + 前缀 <code>logs/</code>。对整桶通知会把 <code>processed/</code> 和标记文件也回灌进 <code>parse-queue</code>。</div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="design">
-  <div class="section-title"><div class="num">3</div>核心设计决策</div>
+<section class="section" id="how">
+  <div class="section-title"><div class="num">3</div>工作原理</div>
 
   <div class="card">
-    <h4>流式 Gzip 解压</h4>
-    <p>原始日志文件通过 <code>DecompressionStream</code> + <code>ReadableStream</code> 流式处理。Worker 无需将整个文件载入内存，逐行解压转换，内存占用恒定，不受文件大小影响。这是 Workers 128 MB 内存限制下的必要设计。</p>
+    <h4>流式、定额解析</h4>
+    <p>原始文件通过 <code>DecompressionStream</code> 边读边逐行转换，永不整文件载入内存。每攒满一批（<code>BATCH_SIZE</code> = 2000 行）即写入 R2 并入队 —— 峰值内存只受批大小限制，与文件大小无关。单次 invocation 内由小并发池（<code>PARSE_PARALLELISM</code>）并行解析多个文件；<code>max_batch_size</code> 必须 ≥ 该值。</p>
 
-    <h4>多队列 · 单 Worker 架构</h4>
-    <p>单个 Worker 脚本消费所有队列。<strong>parse-queue</strong> 负责 R2 → 格式转换；<strong>send-queue</strong> 负责 R2 → HTTP 推送；<strong>parse-dlq</strong> / <strong>send-dlq</strong> 也由同一 Worker 消费。两个主队列失败均重试 5 次后转入死信；之后 Worker 把死信消息以指数退避 + 抖动回灌到各自源队列，瞬时失败自动自愈——无需告警、无需人工排空。</p>
+    <h4>单次读空闲超时</h4>
+    <p>每次 R2 读取带一个空闲超时（<code>PARSE_READ_IDLE_TIMEOUT_MS</code>，默认 45s）。读卡死时中断、且只重试这一个文件，单个卡住的对象不会堵塞整条队列。由于是“单次读空闲”口径（而非整文件总时限），同一个值对任意文件大小都安全 —— 健康的大文件持续出块，永不触发。</p>
 
-    <h4>重复投递控制</h4>
-    <p>Queues 采用 at-least-once 语义。Sender 同 batch 内逐条 <code>await</code> 串行发送；<code>send-queue</code> 的 <code>max_concurrency</code> 不设置，由 Queue autoscaler 自动扩缩多个并发 invocation。确认发送成功后写入 <code>.done</code> 标记，后续重复消息若看到标记或发现 R2 临时文件已删除，则静默 ack——这缩窄了 Queue at-least-once 重复投递的窗口。</p>
+    <h4>幂等投递（接收端无需去重）</h4>
+    <p>队列投递是 at-least-once。Parser 以确定性 key 写每个批次（<code>processed/&lt;safeKey&gt;-&lt;index&gt;.txt</code>）；Sender 成功 POST 后写 <code>.done</code> 标记。任何重新处理时，已有 <code>.done</code> 的批次直接跳过，因此一个批次绝不会被 POST 两次。源级 <code>.done</code> 还能让 Parser 跳过已完整处理过的整个文件。接收端无需自行去重。</p>
 
-    <h4>时间戳兼容</h4>
-    <p>Parser 自动识别 <code>EdgeStartTimestamp</code> 的三种格式：Unix 秒整数、Unix 毫秒整数、RFC 3339 字符串。推荐 Logpush 配置 <code>timestamp_format = unix</code> 以保证一致性。</p>
+    <h4>死信自愈</h4>
+    <p>主队列重试至多 5 次后转入死信队列。同一个 Worker 消费 <code>parse-dlq</code> / <code>send-dlq</code>，按指数退避 + 抖动把死信回灌到源队列。瞬时故障自动恢复 —— 无需告警、无需人工排空。（回灌同样依赖确定性 key + <code>.done</code> 标记，绝不产生重复发送。）</p>
 
-    <h4>CDN 节点国家码映射</h4>
-    <p>目标格式要求的是 <em>CDN 节点所在国家</em>（非客户端国家）。<code>EdgeColoCode</code>（IATA 机场三字码，如 <code>NRT</code> = 东京）通过内置映射表转换为 ISO 3166-1 alpha-2 国家码，映射表按当前活跃的 Cloudflare POP 机场码持续维护。若 <code>EdgeColoCode</code> 为空或未命中映射表，则回退返回 <code>SG</code>。</p>
+    <h4>流式、chunked 发送</h4>
+    <p>Sender 以 <code>R2 对象 → gzip → fetch body</code> 流式发送，单请求内存占用很小。请求使用 HTTP/1.1 <code>Transfer-Encoding: chunked</code>（无 <code>Content-Length</code>）。<strong>客户接收端必须支持 chunked 请求体</strong>；返回 <code>400</code> / <code>411</code> / <code>415</code> 即表示不支持。每次 POST 受 <code>SEND_FETCH_TIMEOUT_MS</code>（默认 30s）约束，接收端卡住即中断重试。单次 invocation 内由小并发池（<code>SEND_PARALLELISM</code>）并行发送多个批次，多个 invocation 也在 autoscaler 下并发。</p>
 
-    <h4>请求时长字段（#6 request_time）</h4>
-    <p>字段 #6 使用 <code>EdgeEndTimestamp - EdgeStartTimestamp</code> 计算，单位为秒并保留毫秒精度。该值表示 Cloudflare edge 收到请求到完成向客户端发送响应的时间。</p>
+    <h4>CDN 节点国家（第 45 字段）</h4>
+    <p>该格式要求填 CDN 节点所在国家（非客户端国家）。<code>EdgeColoCode</code>（IATA 机场三字码，如 <code>NRT</code>=东京）通过内置映射表转为 ISO 3166-1 两字码；为空或未命中时回退为 <code>SG</code>。</p>
 
     <h4>MD5 鉴权</h4>
-    <p>Workers 的 <code>SubtleCrypto</code> API 不支持 MD5 算法，因此 <code>src/index.js</code> 内嵌了纯 JS 实现的 RFC 1321 MD5。鉴权 URL 签名格式为：<code>MD5({uri}-{ts}-{rand}-{privateKey})</code>。</p>
+    <p>Workers 的 <code>SubtleCrypto</code> 不支持 MD5，故内置了纯 JS 的 RFC 1321 实现。URL 签名为 <code>MD5({uri}-{ts}-{rand}-{privateKey})</code>，以 <code>auth_key={ts}-{rand}-{md5}</code> 形式附在 URL 上。</p>
 
-    <h4>响应内容长度字段（#21 sent_http_content_length）</h4>
-    <p><code>http_requests</code> 数据集没有直接暴露 <code>Content-Length</code> 字段。字段 #21 从 <code>ResponseHeaders['content-length']</code> 取值，需通过 API 配置 Logpush Custom Fields（见部署步骤 6b）。未配置或响应头中不含该字段时，统一返回 <code>-</code>。</p>
-    <div class="tip tip-info">Content-Length 的 Custom Fields 配置是可选项。不配置时字段 #21 固定输出 <code>-</code>，与该格式中其他无数据字段的处理方式一致。</div>
+    <h4>时间戳与 Content-Length</h4>
+    <p>Parser 自动识别 <code>EdgeStartTimestamp</code> 的三种格式（Unix 秒、Unix 毫秒、RFC 3339）；建议 Logpush 配置 <code>timestamp_format = unix</code>。第 21 字段（<code>sent_http_content_length</code>）在配置了 Logpush Custom Fields 时取自 <code>ResponseHeaders['content-length']</code>（可选，见“部署”）；否则输出 <code>-</code>。</p>
   </div>
 
   <h3>可靠性模型</h3>
   <table>
-    <tr><th>故障场景</th><th>系统行为</th><th>恢复方式</th></tr>
-    <tr><td>接收端临时不可用</td><td>send-queue 重试最多 5 次，每次之间带延迟</td><td>自动恢复；R2 临时文件保留至确认成功</td></tr>
-    <tr><td>接收端单次请求 hang</td><td>每个 fetch 设置超时 <code>SEND_FETCH_TIMEOUT_MS</code>（默认 120s）：超时即中断并交由 queue 重试</td><td>自动恢复；避免单个 invocation 占满 Queue consumer 的 15 分钟 wall time 上限</td></tr>
-    <tr><td>原始文件含格式错误行</td><td>逐行捕获异常，跳过该行，继续处理</td><td>错误计数写入日志；文件级处理成功</td></tr>
-    <tr><td>parse-queue 处理文件失败（瞬时 I/O 等）</td><td>重试 5 次，耗尽后转入 parse-dlq</td><td>自动 — 见下一行</td></tr>
-    <tr><td>消息进入死信队列（parse-dlq / send-dlq）</td><td>同一 Worker 消费该 DLQ，以指数退避 + 抖动把消息回灌到源队列</td><td>全自动自愈；瞬时失败无需人工排空、无永久丢失</td></tr>
-    <tr><td>Queue 重复投递</td><td>若 <code>.done</code> 已存在或 R2 临时文件已删除，则静默 ack</td><td>at-least-once 投递；由确定性 batch key + <code>.done</code> 标记收敛幂等（接收端无需去重）</td></tr>
+    <tr><th>场景</th><th>行为</th><th>恢复</th></tr>
+    <tr><td>接收端临时不可用</td><td>send-queue 至多重试 5 次，每次间隔一段延迟</td><td>自动；R2 文件在确认投递前一直保留</td></tr>
+    <tr><td>接收端单个请求卡住</td><td>单次 POST 超时 <code>SEND_FETCH_TIMEOUT_MS</code>（默认 30s）中断，回退为队列重试</td><td>自动；单个 invocation 不会撑满 15 分钟消费上限</td></tr>
+    <tr><td>某文件 R2 读卡死</td><td>单次读空闲超时（<code>PARSE_READ_IDLE_TIMEOUT_MS</code>，45s）中断并只重试该文件</td><td>自动；卡住的对象不堵塞其余队列</td></tr>
+    <tr><td>畸形日志行</td><td>逐行捕获错误、跳过该行、批次继续</td><td>记录错误计数；文件级处理仍成功</td></tr>
+    <tr><td>Parser/Sender 处理某文件/批次失败</td><td>队列重试 5 次后转入对应 DLQ</td><td>自动 —— 见下一行</td></tr>
+    <tr><td>消息进入 DLQ</td><td>同一 Worker 按指数退避 + 抖动回灌源队列</td><td>全自动自愈；无需人工排空、不丢数据</td></tr>
+    <tr><td>队列重复投递</td><td>已有 <code>.done</code> 标记（或临时文件已删）→ 静默跳过</td><td>由确定性 key + <code>.done</code> 标记收敛幂等</td></tr>
   </table>
-</section>
-
-<!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="pipeline">
-  <div class="section-title"><div class="num">4</div>数据流转机制与时序分析</div>
-
-  <h3>端到端完整时序图</h3>
-  <div class="ascii-flow">t = 0s       CF 边缘节点处理用户 HTTP 请求，日志暂存 CF 内部缓冲区
-                │
-                │  Logpush 每约 60 秒打包一次
-                ▼
-t = ~60s     Logpush 将过去 ~60s 的所有日志打包压缩为一个 .log.gz 文件
-             写入 R2 存储桶（cdn-logs-raw/logs/YYYYMMDD/）
-             文件大小：低流量时几KB，流量峰值时可达几百MB
-                │
-                │  R2 Event Notification 立即触发（2–5 秒）
-                ▼
-t = ~63s     parse-queue 收到一条消息：{ key: "logs/.../xxx.log.gz" }
-             （消息只携带 R2 对象路径，不携带任何日志内容）
-                │
-                │  Queue 调度 Worker（3–15 秒，取决于并发情况）
-                ▼
-t = ~70s     Parser Worker 开始处理：
-             │  ① 获取 R2 中 .log.gz 文件流（非全量下载）
-             │  ② 流式解压（DecompressionStream，内存恒定）
-             │  ③ 逐行解析 JSON（每行一条 CF 原始日志）
-             │  ④ 格式转换为 145 字段 \u0001 分隔格式
-             │  ⑤ 每累积 2000 条 → 写入 R2 临时文件 → 发消息到 send-queue
-             │  ⑥ 文件处理完毕，不足 2000 条的余量也立即写入并入队
-             │
-             │  处理耗时：小文件 &lt;1s，大文件（几百MB）可达 30s
-             ▼
-t = ~80s     send-queue 收到消息：{ key: "processed/xxx.txt" }
-                │
-                │  Queue 调度 Worker（3–5 秒）
-                ▼
-t = ~85s     Sender Worker 开始处理：
-             │  ① 从 R2 读取临时文件（最多 2000 条目标格式日志）
-             │  ② Gzip 压缩 Body
-             │  ③ 计算 MD5 鉴权签名
-             │  ④ HTTP POST → 合作方日志接收服务器
-             │  ⑤ 返回 HTTP 200 → ack 消息 + 删除 R2 临时文件
-             │  ⑤ 非 200   → 抛出异常 → Queue 重试（最多 5 次）
-             ▼
-t = ~90s     日志成功送达合作方接收端 ✓
-
-端到端总延迟：约 75–120 秒
-（Logpush 积攒 ~60s + R2 通知 ~5s + Queue 调度 ~10s + 处理 ~10s + 发送 ~5s）</div>
-
-  <h3>各阶段触发机制详解</h3>
-  <div class="card">
-    <h4>第一阶段 — Logpush → R2 &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">时间驱动，约每 60 秒一次</span></h4>
-    <p>Logpush 将过去约 60 秒内所有边缘节点产生的日志汇聚打包，写入一个 .log.gz 文件到 R2。这是整个流水线中<strong>唯一的时间驱动触发点</strong>，后续所有阶段均为事件驱动。</p>
-    <p>无论流量大小，约 60 秒触发一次：低流量时文件可能只有 3 条日志；流量峰值时可能有几十万条日志，文件几百 MB。</p>
-
-    <h4>第二阶段 — R2 → parse-queue &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">事件驱动，1 个文件 = 1 条消息</span></h4>
-    <p>R2 每写入一个新文件，立即触发 Event Notification，向 parse-queue 写入一条消息。消息只包含 R2 对象路径（数十字节），彻底规避 Queue 128KB 消息大小限制。</p>
-    <p>R2 写入完成到 Queue 消息可见的延迟：通常 2–5 秒。</p>
-
-    <h4>第三阶段 — Parser &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">事件驱动，每次 invocation 处理 1 个文件</span></h4>
-    <p>parse-queue 消费者使用 <strong>max_batch_size = 1</strong>：每次 invocation 只处理 1 个文件，有消息即触发。一次只处理一个文件，使单次 invocation 的内存和 CPU 占用与文件大小、单条记录大小无关、始终可控；吞吐量通过消费者自动横向扩并发保证（每队列上限 250）。</p>
-    <p>对每个文件，Parser 每处理 <strong>2000</strong> 条（<code>BATCH_SIZE</code>）就写一个 R2 临时文件并发一条 send-queue 消息；文件处理完毕后，不足 2000 条的余量<strong>立即</strong>写入并入队，不会等待下一次触发。</p>
-    <p><strong>举例 — 一个包含 4500 条日志的文件：</strong></p>
-    <pre>第 1–2000 条   → processed/xxx-0.txt（2000 条）+ send-queue 消息
-第 2001–4000 条 → processed/xxx-1.txt（2000 条）+ send-queue 消息
-第 4001–4500 条 → processed/xxx-2.txt（ 500 条）+ send-queue 消息</pre>
-
-    <h4>第四阶段 — Sender Worker &nbsp;<span style="color:#888;font-weight:400;font-size:12px;">事件驱动，按 max_batch_size / max_batch_timeout 批量聚合</span></h4>
-    <p>满足以下任一条件时 Worker 被唤醒：</p>
-    <ul style="font-size:14px; margin:6px 0 10px 20px;">
-      <li><strong>max_batch_size = 50</strong>：单次调用最多接收 50 条待发送消息</li>
-      <li><strong>max_concurrency 未设置</strong>：由 Queue autoscaler 自动扩缩 invocation 数量（当前上限 250）</li>
-      <li><strong>max_batch_timeout = 5s</strong>：不足 50 条但已等待 5 秒 → 同样触发</li>
-    </ul>
-    <p>每条消息对应一次 HTTP POST。同一 invocation 内消息由小并行池处理（<code>SEND_PARALLELISM</code>，默认 2）；多个 invocation 之间由 autoscaler 并行调度以维持高吞吐。发送失败由 Queue 重试（最多 5 次），耗尽后转入 send-dlq，随后被自动回灌（re-drive）回 send-queue。</p>
-  </div>
-
-  <h3>流水线关键参数对照表</h3>
-  <table>
-    <tr><th>参数</th><th>位置</th><th>当前值</th><th>作用说明</th></tr>
-    <tr><td>Logpush 推送间隔</td><td>Logpush Job 配置</td><td>~60s（CF 内部）</td><td>流水线唯一时钟；决定端到端延迟的最小基准值</td></tr>
-    <tr><td>R2 → Queue 通知延迟</td><td>R2 Event Notification</td><td>2–5s（CF 内部）</td><td>固定开销，不可配置</td></tr>
-    <tr><td>parse-queue max_batch_size</td><td>wrangler.toml</td><td>1</td><td>每次 invocation 只处理 1 个文件——控制单次内存与 CPU</td></tr>
-    <tr><td>parse-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>batch=1 时，有消息即触发</td></tr>
-    <tr><td>send-queue max_batch_size</td><td>wrangler.toml</td><td>50</td><td>每次 Sender 调用最多接收的消息数</td></tr>
-    <tr><td>parse-queue / send-queue max_concurrency</td><td>wrangler.toml</td><td><em>未设置</em>（autoscale，每队列上限 250）</td><td>故意留空，使大流量域名能充分扩并发</td></tr>
-    <tr><td>send-queue max_batch_timeout</td><td>wrangler.toml</td><td>5s</td><td>消息不足 50 条时的最长等待时间</td></tr>
-    <tr><td>parse-dlq / send-dlq 消费者</td><td>wrangler.toml</td><td>batch 10，retries 10，concurrency 1</td><td>同一 Worker 排空各 DLQ 并回灌到源队列（自愈）</td></tr>
-    <tr><td>BATCH_SIZE</td><td>wrangler.toml [vars]</td><td>2000</td><td>每次 POST 最多包含的日志行数；校验范围 1–2000</td></tr>
-    <tr><td>SEND_FETCH_TIMEOUT_MS</td><td>wrangler.toml [vars]</td><td>120000</td><td>单次 POST 超时中断时间（ms），用于接收端 hang</td></tr>
-    <tr><td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>wrangler.toml [vars]</td><td>60 / 3600 / 30</td><td>DLQ 回灌的指数退避基数、封顶、抖动</td></tr>
-    <tr><td>parse-queue max_retries</td><td>wrangler.toml</td><td>5</td><td>解析失败重试 5 次后转入 parse-dlq（随后自动回灌）</td></tr>
-    <tr><td>send-queue max_retries</td><td>wrangler.toml</td><td>5</td><td>发送失败重试 5 次后转入 send-dlq（随后自动回灌）</td></tr>
-    <tr><td>cpu_ms</td><td>wrangler.toml [limits]</td><td>300000</td><td>单次 invocation CPU 上限（Enterprise 最大，5 分钟）</td></tr>
-  </table>
-
-</section>
-
-<!-- ══════════════════════════════════════════════════════════ -->
-<section class="section" id="performance">
-  <div class="section-title"><div class="num">5</div>性能指标</div>
-
-  <p style="font-size:13px; color:#888; margin-bottom:12px;">实测时间：2026-03-30，6小时窗口（11:00–17:00 GMT+8）· HTTP 请求总量：13.31M · 数据传输：70.39 GB</p>
-
-  <h3>Worker</h3>
-  <table>
-    <tr><th>指标</th><th>实测数据</th><th>评估</th></tr>
-    <tr><td>Worker 调用次数（6h）</td><td>2k</td><td style="color:var(--green)">与 Logpush 文件批次数吻合</td></tr>
-    <tr><td>内部错误数</td><td>0</td><td style="color:var(--green)">健康</td></tr>
-    <tr><td>CPU 时间超限次数</td><td>3</td><td style="color:var(--yellow)">发生在流量峰值期，需持续观察</td></tr>
-    <tr><td>内存超限次数</td><td>0</td><td style="color:var(--green)">流式处理设计有效</td></tr>
-    <tr><td>中位 CPU Time</td><td>3.52 ms</td><td style="color:var(--green)">远低于 30s 限制</td></tr>
-    <tr><td>P90 CPU Time</td><td>355 ms</td><td style="color:var(--green)">处理大文件批次时正常</td></tr>
-    <tr><td>P99 CPU Time</td><td>3.17s</td><td style="color:var(--green)">在 30s 限制内</td></tr>
-    <tr><td>Wall Time P50 / P99</td><td>1.13s / 18.97s</td><td style="color:var(--green)">含网络等待，在限制内</td></tr>
-    <tr><td>5xx 子请求（发往接收端）</td><td>36 / 15k（0.24%）</td><td style="color:var(--yellow)">接收端间歇性问题，已自动重试</td></tr>
-  </table>
-
-  <h3>parse-queue</h3>
-  <table>
-    <tr><th>指标</th><th>实测数据</th><th>评估</th></tr>
-    <tr><td>消息投递量（6h）</td><td>355</td><td style="color:var(--green)">与 Logpush 文件数吻合</td></tr>
-    <tr><td>消息确认量（ack率）</td><td>347（97.7%）</td><td style="color:var(--green)">健康</td></tr>
-    <tr><td>消息重试次数</td><td>0</td><td style="color:var(--green)">无解析失败</td></tr>
-    <tr><td>实时积压</td><td>0</td><td style="color:var(--green)">实时消费，无积压</td></tr>
-    <tr><td>平均积压（均值/峰值）</td><td>5.47 / 13</td><td style="color:var(--green)">轻载</td></tr>
-    <tr><td>消费者延迟（均值/峰值）</td><td>15.13s / ~250s</td><td style="color:var(--yellow)">峰值时延偏高，流量突发所致，可接受</td></tr>
-    <tr><td>消费者并发（均值/峰值）</td><td>1.37 / 14</td><td style="color:var(--green)">自动弹性扩容有效</td></tr>
-    <tr><td>DLQ 消息数</td><td>0</td><td style="color:var(--green)">零数据丢失</td></tr>
-  </table>
-
-  <h3>send-queue</h3>
-  <table>
-    <tr><th>指标</th><th>实测数据</th><th>评估</th></tr>
-    <tr><td>消息投递量（6h）</td><td>14.9k</td><td style="color:var(--green)">约 1490 万条日志行成功推送</td></tr>
-    <tr><td>消息确认量</td><td>15.45k</td><td style="color:var(--green)">含历史积压清零</td></tr>
-    <tr><td>消息重试次数</td><td>0</td><td style="color:var(--green)">发送失败未上升至 Queue 级重试</td></tr>
-    <tr><td>实时积压</td><td>0</td><td style="color:var(--green)">实时消费</td></tr>
-    <tr><td>平均积压（均值/峰值）</td><td>32.6 / 106</td><td style="color:var(--yellow)">峰值积压明显，在容量范围内</td></tr>
-    <tr><td>消费者延迟（均值/峰值）</td><td>5.62s / ~55s</td><td style="color:var(--green)">可接受</td></tr>
-    <tr><td>消费者并发（均值/峰值）</td><td>22.07 / ~220</td><td style="color:var(--green)">由 autoscaler 根据 backlog 自动扩缩</td></tr>
-    <tr><td>DLQ 消息数</td><td>0</td><td style="color:var(--green)">零数据丢失</td></tr>
-  </table>
-
-  <h3>负载余量评估</h3>
-  <table>
-    <tr><th>维度</th><th>当前负载</th><th>5倍流量</th><th>10倍流量</th></tr>
-    <tr><td>Worker CPU</td><td>约 5% 上限</td><td style="color:var(--green)">安全</td><td style="color:var(--yellow)">大文件时 P99 接近上限</td></tr>
-    <tr><td>Worker 内存</td><td>0次超限</td><td style="color:var(--green)">安全（流式设计）</td><td style="color:var(--green)">安全</td></tr>
-    <tr><td>parse-queue 延迟</td><td>均值 15s，峰值 250s</td><td style="color:var(--yellow)">峰值延迟 5–10 分钟</td><td style="color:var(--red)">持续积压风险</td></tr>
-    <tr><td>send-queue 并发</td><td>autoscale 至上限 250 个 invocation × 1 个 POST</td><td style="color:var(--green)">充裕</td><td style="color:var(--yellow)">接收端慢时可能积压</td></tr>
-    <tr><td>接收端可用性</td><td>5xx 0.24%</td><td style="color:var(--yellow)">需监控 5xx 率</td><td style="color:var(--red)">可能成为瓶颈</td></tr>
-  </table>
-  <div class="tip tip-info">综合评估：当前流量下系统运行轻松健康。send-queue 由 autoscaler 自动扩缩；并发 invocation 间残留的极窄重复窗口由 <code>.done</code> 标记收敛，不要求客户侧改动。</div>
-
-  <h3>关键监控指标建议</h3>
-  <table>
-    <tr><th>优先级</th><th>指标</th><th>建议告警阈值</th></tr>
-    <tr><td>★★★</td><td>DLQ 消息数（两个队列）</td><td>&gt; 0，立即处理</td></tr>
-    <tr><td>★★★</td><td>实时积压（持续）</td><td>&gt; 100 条持续超过 5 分钟</td></tr>
-    <tr><td>★★★</td><td>CPU 时间超限次数</td><td>&gt; 10 次/小时</td></tr>
-    <tr><td>★★</td><td>parse-queue 消费者延迟（持续）</td><td>持续超过 5 分钟</td></tr>
-    <tr><td>★★</td><td>5xx 子请求比例</td><td>&gt; 0.5% 总请求量</td></tr>
-    <tr><td>★★</td><td>send-queue 积压 / 延迟</td><td>持续增长超过 5 分钟</td></tr>
-    <tr><td>★</td><td>P99 CPU Time</td><td>&gt; 20s</td></tr>
-  </table>
-
-
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="deploy">
-  <div class="section-title"><div class="num">6</div>部署指南</div>
+  <div class="section-title"><div class="num">4</div>部署</div>
 
-  <div class="tip tip-warn">前置条件：本地已安装 Node.js v18+；已安装 Wrangler CLI（<code>npm install -g wrangler</code>）；已准备好 Cloudflare API Token，权限范围限定为目标账号，需包含以下三项：<strong>Workers Scripts:Edit</strong>、<strong>Workers R2 Storage:Edit</strong>、<strong>Workers Queue:Edit</strong>（可使用 Edit Cloudflare Workers 模板后手动追加后两项）。</div>
+  <div class="tip tip-warn">前置条件：本地安装 Node.js v18+ 与 Wrangler CLI；一个范围限定到目标账号、具备 <strong>Workers Scripts:Edit</strong>、<strong>Workers R2 Storage:Edit</strong>、<strong>Workers Queue:Edit</strong> 权限的 Cloudflare API Token。并从日志伙伴处获取：接收端 URL、鉴权私钥、目标 URI 路径。</div>
 
-  <div class="tip tip-warn"><strong>根据实际部署修改 <code>wrangler.toml</code>：</strong>
-    <ul style="margin:6px 0 0 20px; font-size:13.5px;">
-      <li><code>name</code> → Worker 名字（自定义，任意唯一名称）</li>
-      <li><strong><code>account_id</code> → 必须改为你自己的 Cloudflare Account ID</strong>（Dashboard 右上角，或 <code>wrangler whoami</code> 获取）</li>
-      <li><code>bucket_name</code> → 你的 R2 bucket 名字（在步骤1创建）</li>
-      <li><code>[vars]</code> 里的 <code>R2_BUCKET_NAME</code> → 必须与上方 <code>bucket_name</code> 完全一致</li>
-      <li>Queue 名字（producers / consumers 中的 <code>queue = "..."</code>）→ 你的实际 Queue 名字（在步骤2创建）</li>
-      <li><code>[vars]</code> 里的 <code>PARSE_QUEUE_NAME</code> / <code>SEND_QUEUE_NAME</code> → 必须与 queue 名字一致</li>
-    </ul>
-    仓库中 <code>wrangler.toml</code> 包含示例值，部署前须将 <code>account_id</code> 改为你自己的；其他字段按需自定义。
-  </div>
-  <div class="tip tip-warn">部署前请向日志对接方确认：推送服务器地址（Endpoint）、鉴权私钥（Private Key）、接收 URI 路径（URI Path）。</div>
+  <div class="tip tip-warn"><strong>本模板每个域名部署一份。</strong>只需替换 <code>wrangler.toml</code> 中标注 <span class="must">【按域名修改 / 按域名必填】</span> 的项，见下方<a href="#config" style="color:var(--orange)">配置</a>清单。</div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">1</div><h3>创建 R2 存储桶</h3></div>
+    <div class="step-card-header"><div class="snum">1</div><h3>创建 R2 桶</h3></div>
     <div class="step-card-body">
       <p><strong>Dashboard → R2 Object Storage → Create bucket</strong></p>
-      <ul>
-        <li>名称：<code>cdn-logs-raw</code></li>
-        <li>Location：Automatic（默认）</li>
-      </ul>
+      <ul><li>名称：<code>&lt;domain&gt;-com</code>（须与 <code>bucket_name</code> 及 <code>[vars].R2_BUCKET_NAME</code> 一致）</li><li>位置：Automatic</li></ul>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">2</div><h3>创建 4 个 Queue</h3></div>
+    <div class="step-card-header"><div class="snum">2</div><h3>创建队列</h3></div>
     <div class="step-card-body">
-      <p><strong>Dashboard → Workers &amp; Pages → Queues → Create queue</strong></p>
-      <p>依次创建以下 4 个队列（名称须完全一致）：</p>
+      <p><strong>Dashboard → Workers &amp; Pages → Queues → Create queue</strong>，创建全部 4 个：</p>
       <table>
-        <tr><th>Queue 名称</th><th>用途</th></tr>
-        <tr><td><code>parse-queue</code></td><td>接收新日志文件通知，触发 Parser Worker</td></tr>
-        <tr><td><code>send-queue</code></td><td>接收转换完成通知，触发 Sender Worker</td></tr>
-        <tr><td><code>parse-dlq</code></td><td>解析失败的死信队列——由 Worker 自动消费并回灌回 parse-queue</td></tr>
-        <tr><td><code>send-dlq</code></td><td>发送失败的死信队列——由 Worker 自动消费并回灌回 send-queue</td></tr>
+        <tr><th>队列</th><th>用途</th></tr>
+        <tr><td><code>parse-queue-&lt;domain&gt;</code></td><td>每个新 R2 文件触发 Parser</td></tr>
+        <tr><td><code>send-queue-&lt;domain&gt;</code></td><td>每个处理后批次触发 Sender</td></tr>
+        <tr><td><code>parse-dlq-&lt;domain&gt;</code></td><td>解析死信 —— 被自动消费并回灌 parse-queue</td></tr>
+        <tr><td><code>send-dlq-&lt;domain&gt;</code></td><td>发送死信 —— 被自动消费并回灌 send-queue</td></tr>
       </table>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">3</div><h3>配置 R2 Event Notification</h3></div>
+    <div class="step-card-header"><div class="snum">3</div><h3>配置 R2 事件通知</h3></div>
     <div class="step-card-body">
-      <p><strong>R2 → cdn-logs-raw → Settings → Event Notifications → Add notification</strong></p>
+      <p><strong>R2 → &lt;domain&gt;-com → Settings → Event Notifications → Add notification</strong></p>
       <ul>
-        <li>Event type：<code>object-create</code></li>
-        <li>Queue：<code>parse-queue</code></li>
-        <li>Prefix：<code>logs/</code>（必填；不要对整个 bucket 发送通知）</li>
-        <li>Suffix（可选）：<code>.gz</code></li>
+        <li>事件类型：<code>object-create</code></li>
+        <li>队列：<code>parse-queue-&lt;domain&gt;</code></li>
+        <li>前缀：<code>logs/</code>（必填 —— 不要对整桶通知）</li>
+        <li>后缀（可选）：<code>.gz</code></li>
       </ul>
     </div>
   </div>
@@ -679,346 +411,147 @@ t = ~90s     日志成功送达合作方接收端 ✓
   <div class="step-card">
     <div class="step-card-header"><div class="snum">4</div><h3>设置 Worker Secrets</h3></div>
     <div class="step-card-body">
-      <p>在项目目录下，通过 Wrangler 设置加密 Secret：</p>
-      <pre><span class="comment"># 日志接收服务器地址（不含 URI 路径，不含末尾斜杠）</span>
+      <pre><span class="comment"># 接收端（base URL，结尾不带斜杠）</span>
 wrangler secret put CTYUN_ENDPOINT
 
 <span class="comment"># 鉴权私钥</span>
 wrangler secret put CTYUN_PRIVATE_KEY
 
-<span class="comment"># 接收 URI 路径（如 /logpost/yourpath）</span>
-wrangler secret put CTYUN_URI_EDGE
-
-<span class="comment"># 验证已设置的 Secret</span>
-wrangler secret list</pre>
-      <div class="tip tip-info">若使用 GitHub Actions CI/CD，Secrets 仍需通过 <code>wrangler secret put</code> 直接写入 Cloudflare。它们会持久保存在 CF 云端，无需每次部署时重新上传。</div>
+<span class="comment"># 目标 URI 路径（如 /logpost/yourpath）</span>
+wrangler secret put CTYUN_URI_EDGE</pre>
+      <div class="tip tip-info">Secret 设置一次即持久保存在 Cloudflare，后续部署无需重新上传。</div>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">5</div><h3>部署 Worker</h3></div>
+    <div class="step-card-header"><div class="snum">5</div><h3>部署</h3></div>
     <div class="step-card-body">
-      <pre>wrangler deploy</pre>
-      <div class="tip tip-success">预期输出中应确认：parse-queue 和 send-queue 的 Producer 与 Consumer 绑定均已创建。Current Version ID 已分配。</div>
-      <div class="tip tip-warn">若通过 GitHub Actions 部署，直接 push 到 <code>main</code> 分支即可，CI/CD 会自动执行 <code>wrangler deploy</code>。</div>
+      <pre>wrangler deploy        <span class="comment"># 或：push 到 main → GitHub Actions 自动部署</span></pre>
+      <div class="tip tip-success">输出应确认 parse-queue / send-queue 的 producer 与 consumer 绑定，以及一个新的 Version ID。</div>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">6</div><h3>配置 Logpush Job</h3></div>
+    <div class="step-card-header"><div class="snum">6</div><h3>配置 Logpush 任务</h3></div>
     <div class="step-card-body">
       <p><strong>Dashboard → [目标域名] → Analytics &amp; Logs → Logpush → Create a Logpush job</strong></p>
       <ol>
-        <li>目的地：选 <strong>R2</strong></li>
-        <li>Bucket：<code>cdn-logs-raw</code> &nbsp;·&nbsp; Path prefix：<code>logs/{DATE}/</code></li>
+        <li>目标：<strong>R2</strong> &nbsp;·&nbsp; 桶：<code>&lt;domain&gt;-com</code> &nbsp;·&nbsp; 路径前缀：<code>logs/{DATE}/</code></li>
         <li>数据集：<strong>HTTP requests</strong></li>
-        <li>字段：<strong>全选所有字段</strong>（代码对缺失字段有容错处理）</li>
-        <li>Timestamp format：<strong>Unix</strong></li>
-        <li>Sample rate：<code>1</code>（100% 采样）</li>
+        <li>字段：<strong>全选</strong>（Worker 对缺失字段有兜底）</li>
+        <li>时间戳格式：<strong>Unix</strong> &nbsp;·&nbsp; 采样率：<code>1</code>（100%）</li>
       </ol>
-      <div class="tip tip-warn">Timestamp format 必须选 <strong>Unix</strong>，否则时间戳解析可能出错。</div>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum" style="background:#888">6b</div><h3>开启 Content-Length 日志采集 <span style="font-weight:400; font-size:13px; color:#aaa;">— 可选</span></h3></div>
+    <div class="step-card-header"><div class="snum" style="background:#888">6b</div><h3>启用 Content-Length 记录 <span style="font-weight:400; font-size:13px; color:#aaa;">— 可选</span></h3></div>
     <div class="step-card-body">
-      <p>默认情况下，字段 #21（<code>sent_http_content_length</code>）回退使用 <code>EdgeResponseBodyBytes</code>。如需采集真实的 <code>Content-Length</code> 响应头值，需通过 API 配置 Logpush Custom Fields。这是一次性的 Zone 级别配置。</p>
-      <div class="tip tip-warn">此配置只能通过 API 完成，Cloudflare Dashboard UI 不支持设置 raw response fields。</div>
-
-      <h4>步骤 A — 查找是否已有 Custom Fields Ruleset</h4>
-      <pre><span class="comment"># 列出所有 ruleset，找 http_log_custom_fields 阶段</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
-  --request GET \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  | jq '.result[] | select(.phase == "http_log_custom_fields") | {id, phase}'</pre>
-      <p>若有返回，记录 <code>id</code> 作为 <code>RULESET_ID</code>，跳至步骤 C。若无返回，执行步骤 B。</p>
-
-      <h4>步骤 B — 创建 Custom Fields Ruleset（仅步骤 A 无结果时执行）</h4>
-      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
-  --request POST \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "name": "Zone-level phase entry point",
-    "kind": "zone",
-    "description": "Custom log fields for Logpush",
-    "phase": "http_log_custom_fields"
-  }' | jq '.result.id'</pre>
-      <p>记录返回的 <code>id</code> 作为 <code>RULESET_ID</code>。</p>
-
-      <h4>步骤 C — 配置采集 content-length 响应头</h4>
-      <p>使用 <code>raw_response_fields</code> 捕获源站返回的原始 <code>content-length</code> 值（CF Transform Rules 修改之前）。</p>
-      <pre>curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$RULESET_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "rules": [
-      {
-        "action": "log_custom_field",
-        "expression": "true",
-        "description": "Capture content-length response header for Logpush",
-        "action_parameters": {
-          "raw_response_fields": [
-            { "name": "content-length" }
-          ]
-        }
-      }
-    ]
-  }'</pre>
-
-      <h4>步骤 D — 在 Logpush Job 中加入 ResponseHeaders 字段</h4>
-      <pre><span class="comment"># 先获取 Logpush Job ID</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs" \
-  --request GET \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  | jq '.result[] | {id, name, dataset}'
-
-<span class="comment"># 更新 Job，加入 ResponseHeaders 字段</span>
-curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/logpush/jobs/$JOB_ID" \
-  --request PUT \
-  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --json '{
-    "output_options": {
-      "field_names": [
-        "CacheCacheStatus","ClientCountry","ClientIP","ClientRequestBytes",
-        "ClientRequestHost","ClientRequestMethod","ClientRequestProtocol",
-        "ClientRequestReferer","ClientRequestScheme","ClientRequestURI",
-        "ClientRequestUserAgent","ClientSSLProtocol","ClientSrcPort",
-        "EdgeColoCode","EdgeResponseBodyBytes","EdgeResponseBytes",
-        "EdgeResponseContentType","EdgeResponseStatus","EdgeServerIP",
-        "EdgeStartTimestamp","EdgeEndTimestamp","EdgeTimeToFirstByteMs","OriginIP",
-        "OriginRequestHeaderSendDurationMs","OriginResponseDurationMs",
-        "OriginResponseHeaderReceiveDurationMs","OriginResponseStatus",
-        "OriginTLSHandshakeDurationMs","ParentRayID","RayID",
-        "ResponseHeaders"
-      ],
-      "timestamp_format": "unix"
-    }
-  }'</pre>
-      <div class="tip tip-success">配置完成后，每条日志的 <code>ResponseHeaders</code> 字段将包含 <code>{"content-length": "12345"}</code>，Worker 自动将其用于字段 #21。</div>
-      <div class="tip tip-info">注意：HTTP/2 响应或 CF 开启 gzip 压缩时，源站可能不发送 <code>Content-Length</code> 头（改用 chunked transfer encoding），此时字段 #21 输出 <code>-</code>。</div>
+      <p>若要让第 21 字段取真实的 <code>Content-Length</code> 响应头，需通过 API 配置 Logpush Custom Fields（一次性的 zone 级设置，Dashboard UI 无法配置）：新增一个 <code>http_log_custom_fields</code> ruleset 抓取 <code>content-length</code>，并把 <code>ResponseHeaders</code> 加入 Logpush 任务的字段列表。不配置时，第 21 字段输出 <code>-</code>。</p>
     </div>
   </div>
 
   <div class="step-card">
-    <div class="step-card-header"><div class="snum">7</div><h3>验证端到端链路</h3></div>
+    <div class="step-card-header"><div class="snum">7</div><h3>端到端验证</h3></div>
     <div class="step-card-body">
-      <p>等待约 2 分钟（Logpush 首次写入需初始化），逐步验证以下三处：</p>
+      <p>等约 2 分钟后检查：</p>
       <ol>
-        <li><strong>R2：</strong><code>cdn-logs-raw/logs/</code> 目录下出现 <code>.log.gz</code> 文件</li>
-        <li><strong>Queue：</strong><code>parse-queue</code> 的 Messages Processed 数量持续增长</li>
-        <li><strong>Worker 日志：</strong>通过 <code>wrangler tail ctyun-logpush</code> 查看实时日志</li>
+        <li><strong>R2：</strong><code>&lt;domain&gt;-com/logs/</code> 出现 <code>.log.gz</code> 文件</li>
+        <li><strong>队列：</strong>parse-queue / send-queue 的 “Messages Processed” 在增长；DLQ 接近 0</li>
+        <li><strong>Worker 日志：</strong><code>wrangler tail</code></li>
       </ol>
-      <pre><span class="comment"># 正常日志输出示例（LOG_LEVEL=info）</span>
+      <pre><span class="comment"># 预期（LOG_LEVEL=info）</span>
 [INFO] Parsing: logs/20260328/xxx.log.gz
-[INFO] Done: logs/20260328/xxx.log.gz | lines=73 batches=1 errors=0
-[INFO] Sent 73 lines → HTTP 200 | processed/xxx.txt</pre>
-      <div class="tip tip-error">发送返回 HTTP 401/403 → 检查 CTYUN_PRIVATE_KEY 是否正确</div>
-      <div class="tip tip-error">发送返回 HTTP 404 → 检查 CTYUN_URI_EDGE 路径是否正确</div>
+[INFO] Done: logs/20260328/xxx.log.gz | lines=73 batches=1 errors=0 ...
+[INFO] Sent 73 ... → HTTP 200 | processed/xxx.txt</pre>
+      <div class="tip tip-error">发送返回 401/403 → 检查 <code>CTYUN_PRIVATE_KEY</code>。 &nbsp; 返回 404 → 检查 <code>CTYUN_URI_EDGE</code>。</div>
     </div>
   </div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="config">
-  <div class="section-title"><div class="num">7</div>配置参考</div>
+  <div class="section-title"><div class="num">5</div>配置</div>
 
-  <h3>wrangler.toml</h3>
-  <pre><span class="key">name</span>                = <span class="str">"ctyun-logpush"</span>
-<span class="key">main</span>                = <span class="str">"src/index.js"</span>
-<span class="key">compatibility_date</span>  = <span class="str">"2026-03-27"</span>
-<span class="key">compatibility_flags</span> = [<span class="str">"nodejs_compat"</span>]
-<span class="key">account_id</span>          = <span class="str">"&lt;your-account-id&gt;"</span>
+  <h3>按域名修改清单 <span style="font-weight:400;font-size:13px;color:#aaa;">— 每次部署只需改这些</span></h3>
+  <table>
+    <tr><th><code>wrangler.toml</code> 中</th><th class="must">改为</th></tr>
+    <tr><td><code>name</code></td><td><code>&lt;domain&gt;-com-log</code></td></tr>
+    <tr><td><code>account_id</code></td><td>该域名所在的 Cloudflare Account ID</td></tr>
+    <tr><td>R2 <code>bucket_name</code> + <code>[vars].R2_BUCKET_NAME</code></td><td><code>&lt;domain&gt;-com</code>（两处一致）</td></tr>
+    <tr><td>队列名 —— 2 个 producer、4 个 consumer，以及 4 个 <code>[vars]</code> 的 <code>*_QUEUE_NAME</code> / <code>*_DLQ_NAME</code></td><td><code>parse-queue-&lt;domain&gt;</code>、<code>send-queue-&lt;domain&gt;</code>、<code>parse-dlq-&lt;domain&gt;</code>、<code>send-dlq-&lt;domain&gt;</code>（所有引用保持一致）</td></tr>
+    <tr><td><code>[vars].FIELD11_SERVER_IP</code></td><td><span class="must">必填。</span>该域名的 anycast/解析 IP（如 <code>172.65.90.64</code>），写入第 11 字段 <code>server_ip</code>；留空则输出 <code>-</code>。</td></tr>
+  </table>
+  <p>其余项均有合理默认，通常只改上表内容。</p>
 
-[[r2_buckets]]
-<span class="key">binding</span>     = <span class="str">"RAW_BUCKET"</span>
-<span class="key">bucket_name</span> = <span class="str">"cdn-logs-raw"</span>
-
-[[queues.producers]]
-<span class="key">binding</span> = <span class="str">"PARSE_QUEUE"</span>
-<span class="key">queue</span>   = <span class="str">"parse-queue"</span>
-
-[[queues.producers]]
-<span class="key">binding</span> = <span class="str">"SEND_QUEUE"</span>
-<span class="key">queue</span>   = <span class="str">"send-queue"</span>
-
-[[queues.consumers]]
-<span class="key">queue</span>              = <span class="str">"parse-queue"</span>
-<span class="key">max_batch_size</span>     = 1     <span class="comment"># 每次 invocation 只处理 1 文件 → 控制内存与 CPU</span>
-<span class="key">max_batch_timeout</span>  = 5
-<span class="key">max_retries</span>        = 5
-<span class="key">dead_letter_queue</span>  = <span class="str">"parse-dlq"</span>
-
-[[queues.consumers]]
-<span class="key">queue</span>              = <span class="str">"send-queue"</span>
-<span class="key">max_batch_size</span>     = 50
-<span class="key">max_batch_timeout</span>  = 5
-<span class="key">max_retries</span>        = 5
-<span class="key">dead_letter_queue</span>  = <span class="str">"send-dlq"</span>
-<span class="comment"># 两个主队列均故意不设 max_concurrency：autoscale 至每队列上限 250</span>
-
-<span class="comment"># DLQ 消费者 —— 同一 Worker 把死信消息回灌回源队列</span>
-[[queues.consumers]]
-<span class="key">queue</span>           = <span class="str">"parse-dlq"</span>
-<span class="key">max_batch_size</span>  = 10
-<span class="key">max_retries</span>     = 10
-<span class="key">max_concurrency</span> = 1
-
-[[queues.consumers]]
-<span class="key">queue</span>           = <span class="str">"send-dlq"</span>
-<span class="key">max_batch_size</span>  = 10
-<span class="key">max_retries</span>     = 10
-<span class="key">max_concurrency</span> = 1
-
-[vars]
-<span class="key">BATCH_SIZE</span>            = <span class="str">"2000"</span>    <span class="comment"># 每次 POST 的最大日志行数（1–2000）</span>
-<span class="key">RAW_LOG_PREFIX</span>        = <span class="str">"logs/"</span>   <span class="comment"># 原始 Logpush 对象前缀</span>
-<span class="key">RAW_LOG_SUFFIX</span>        = <span class="str">".log.gz"</span> <span class="comment"># 原始 Logpush 对象后缀</span>
-<span class="key">LOG_LEVEL</span>             = <span class="str">"info"</span>    <span class="comment"># debug | info | warn | error</span>
-<span class="key">SEND_PARALLELISM</span>      = <span class="str">"2"</span>       <span class="comment"># 单次发送 invocation 内并行 POST 数</span>
-<span class="key">SEND_FETCH_TIMEOUT_MS</span> = <span class="str">"120000"</span>  <span class="comment"># 单次 POST 超时（ms）</span>
-<span class="key">RETRY_DELAY_SECONDS</span>   = <span class="str">"30"</span>      <span class="comment"># 失败消息重试前的延迟</span>
-<span class="key">REDRIVE_BASE_DELAY_SECONDS</span> = <span class="str">"60"</span>   <span class="comment"># DLQ 回灌退避基数</span>
-<span class="key">REDRIVE_MAX_DELAY_SECONDS</span>  = <span class="str">"3600"</span> <span class="comment"># DLQ 回灌退避封顶</span>
-<span class="key">REDRIVE_JITTER_SECONDS</span>     = <span class="str">"30"</span>   <span class="comment"># DLQ 回灌抖动</span>
-
-[limits]
-<span class="key">cpu_ms</span> = 300000   <span class="comment"># Enterprise 最大（5 分钟）；为大文件留足 CPU 余量</span>
-
-<span class="comment"># [triggers] crons = ["* * * * *"] —— 每分钟触发 scheduled() 补扫(reconciliation)安全网，兜底"事件通知漏/晚"的对象</span>
-<span class="comment"># workers_dev 是 wrangler.toml 顶层配置，不属于 [vars]</span></pre>
-
-  <h3>环境变量说明</h3>
+  <h3>环境变量</h3>
   <table class="env-table">
-    <tr><th>变量名</th><th>类型</th><th>示例值</th><th>说明</th></tr>
-    <tr>
-      <td>CTYUN_ENDPOINT</td><td>Secret</td>
-      <td>http://log.example.com:5580</td>
-      <td>日志接收服务器地址，不含 URI 路径，不含末尾斜杠</td>
-    </tr>
-    <tr>
-      <td>CTYUN_PRIVATE_KEY</td><td>Secret</td>
-      <td>YourKey@1234</td>
-      <td>MD5 鉴权私钥，由对接方提供</td>
-    </tr>
-    <tr>
-      <td>CTYUN_URI_EDGE</td><td>Secret</td>
-      <td>/logpost/yourpath</td>
-      <td>HTTP POST 目标 URI 路径，由对接方提供</td>
-    </tr>
-    <tr>
-      <td>R2_BUCKET_NAME</td><td>Var</td>
-      <td>cdn-logs-raw</td>
-      <td>R2 bucket 名字。<strong>必须与</strong>上方 <code>[[r2_buckets]] bucket_name</code> 完全一致。</td>
-    </tr>
-    <tr>
-      <td>BATCH_SIZE</td><td>Var</td>
-      <td>2000</td>
-      <td>每批 POST 包含的日志行数。Worker 会校验该值必须是 1 到 2000 的整数。</td>
-    </tr>
-    <tr>
-      <td>RAW_LOG_PREFIX / RAW_LOG_SUFFIX</td><td>Var</td>
-      <td>logs/ / .log.gz</td>
-      <td>原始 Logpush 对象 allowlist。不匹配的 R2 通知会被 ack 并跳过。</td>
-    </tr>
-    <tr>
-      <td>LOG_LEVEL</td><td>Var</td>
-      <td>info</td>
-      <td>Worker 日志级别。排查问题时改为 <code>debug</code>，生产恢复 <code>info</code></td>
-    </tr>
-    <tr>
-      <td>SEND_FETCH_TIMEOUT_MS</td><td>Var</td>
-      <td>120000</td>
-      <td>单次 POST 的超时中断时间（毫秒，范围 1000–120000）。接收端 hang 时中断并交回队列重试，避免单个 invocation 占满 15 分钟消费者 wall time 上限。</td>
-    </tr>
-    <tr>
-      <td>SEND_PARALLELISM</td><td>Var</td>
-      <td>2</td>
-      <td>单次发送 invocation 内的并行 POST 数（1 = 串行；软上限 8）。</td>
-    </tr>
-    <tr>
-      <td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>Var</td>
-      <td>60 / 3600 / 30</td>
-      <td>DLQ 回灌延迟 —— 把死信消息回灌回源队列时的指数退避基数、封顶、随机抖动（秒）。</td>
-    </tr>
+    <tr><th>名称</th><th>默认</th><th>说明</th></tr>
+    <tr><td>CTYUN_ENDPOINT</td><td><em>secret</em></td><td>接收端 base URL（结尾不带斜杠、不含 URI 路径）</td></tr>
+    <tr><td>CTYUN_PRIVATE_KEY</td><td><em>secret</em></td><td>MD5 鉴权私钥（日志伙伴提供）</td></tr>
+    <tr><td>CTYUN_URI_EDGE</td><td><em>secret</em></td><td>HTTP POST 的目标 URI 路径（日志伙伴提供）</td></tr>
+    <tr><td>FIELD11_SERVER_IP</td><td><span class="must">""（必填）</span></td><td>该域名的 anycast/解析 IP，用于第 11 字段；留空输出 <code>-</code></td></tr>
+    <tr><td>BATCH_SIZE</td><td>2000</td><td>每批行数（1–2000，每批一次 POST）。改此值前先清空 DLQ</td></tr>
+    <tr><td>PARSE_PARALLELISM</td><td>2</td><td>parse 单次 invocation 内并行解析的文件数（须 ≤ parse <code>max_batch_size</code>；上限 8）</td></tr>
+    <tr><td>PARSE_READ_IDLE_TIMEOUT_MS</td><td>45000</td><td>单次读空闲超时(ms)，读卡死则中断并只重试该文件；0=不限</td></tr>
+    <tr><td>SEND_PARALLELISM</td><td>2</td><td>send 单次 invocation 内并行 POST 数（1=串行；上限 8）</td></tr>
+    <tr><td>SEND_FETCH_TIMEOUT_MS</td><td>30000</td><td>单次发送 fetch 超时(ms)</td></tr>
+    <tr><td>RETRY_DELAY_SECONDS</td><td>30</td><td>失败消息重试前的延迟(s)</td></tr>
+    <tr><td>REDRIVE_BASE / MAX / JITTER_DELAY_SECONDS</td><td>60 / 3600 / 30</td><td>DLQ 重驱动的退避基数、封顶、抖动(s)</td></tr>
+    <tr><td>RAW_LOG_PREFIX / RAW_LOG_SUFFIX</td><td>logs/ / .log.gz</td><td>原始日志对象白名单；不匹配的通知会被 ack 跳过</td></tr>
+    <tr><td>PUSH_START_TIME</td><td>""</td><td>留空=推送全部新日志；未来时间=到点开始推；过去时间=扫 R2 补传历史（ISO 8601）</td></tr>
+    <tr><td>LOG_LEVEL</td><td>info</td><td>debug | info | warn | error</td></tr>
   </table>
 
-  <div class="tip tip-info">Secret 通过 <code>wrangler secret put &lt;NAME&gt;</code> 一次性设置后持久保存在 Cloudflare 云端，任何情况下不得写入 <code>wrangler.toml</code> 或提交至代码仓库。</div>
+  <h3>消费者与上限设置</h3>
+  <table>
+    <tr><th>设置</th><th>值</th><th>说明</th></tr>
+    <tr><td>parse-queue</td><td>max_batch_size 2 · timeout 5s · retries 5 → parse-dlq</td><td>有界并发池；<code>max_concurrency</code> 不设（自动扩容，上限 250）</td></tr>
+    <tr><td>send-queue</td><td>max_batch_size 50 · timeout 5s · retries 5 → send-dlq</td><td><code>max_concurrency</code> 不设（自动扩容，上限 250）</td></tr>
+    <tr><td>parse-dlq / send-dlq</td><td>max_batch_size 10 · timeout 30s · retries 10 · concurrency 1</td><td>重驱动消费者；温和排空，自身不设 DLQ</td></tr>
+    <tr><td><code>[limits].cpu_ms</code></td><td>300000</td><td>Enterprise 上限（5 分钟），留足余量</td></tr>
+    <tr><td><code>[triggers].crons</code></td><td><code>"* * * * *"</code></td><td>触发 scheduled handler；仅当 <code>PUSH_START_TIME</code> 为过去时间时才扫描补传，否则秒级返回</td></tr>
+  </table>
 
-  <h3>GitHub Actions CI/CD</h3>
-  <p>仓库中包含 <code>.github/workflows/deploy.yml</code>。向 <code>main</code> 分支推送代码时，自动触发 <code>wrangler deploy</code>（仅部署代码和配置）。</p>
-  <p>CI/CD 所需 GitHub secret 仅一个：<code>CLOUDFLARE_API_TOKEN</code>。Worker secrets（<code>CTYUN_ENDPOINT</code>、<code>CTYUN_PRIVATE_KEY</code>、<code>CTYUN_URI_EDGE</code>）通过 <code>wrangler secret put</code> 独立管理。</p>
+  <div class="tip tip-info">Secret 用 <code>wrangler secret put &lt;NAME&gt;</code> 设置，绝不写入 <code>wrangler.toml</code>。GitHub Actions 只需一个仓库 secret：<code>CLOUDFLARE_API_TOKEN</code>；push 到 <code>main</code> 即运行 <code>wrangler deploy</code>。</div>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <section class="section" id="ops">
-  <div class="section-title"><div class="num">8</div>日常运维</div>
+  <div class="section-title"><div class="num">6</div>运维</div>
 
-  <h3>Dashboard 健康状态检查</h3>
+  <h3>健康指标</h3>
   <table>
-    <tr><th>检查项</th><th>正常状态</th><th>异常处理</th></tr>
-    <tr><td>R2 <code>logs/</code> 目录</td><td>每约 1 分钟有新 <code>.gz</code> 文件</td><td>检查 Logpush Job 是否处于 Enabled 状态</td></tr>
-    <tr><td>parse-queue 积压</td><td>接近 0</td><td>持续积压 → 查看 Worker 日志排查解析错误</td></tr>
-    <tr><td>send-queue 积压</td><td>接近 0</td><td>持续积压 → 检查接收端服务器可用性</td></tr>
-    <tr><td>parse-dlq / send-dlq</td><td>接近 0（自动排空）</td><td>Worker 会自动把死信回灌回源队列；只有<em>持续增长</em>的 DLQ 才需关注（确实无法处理的文件或接收端宕机）</td></tr>
-    <tr><td>R2 <code>processed/</code> 目录</td><td>无文件积压</td><td>文件积压 → Sender 异常，查看 Worker 日志</td></tr>
+    <tr><th>指标</th><th>健康</th><th>异常时</th></tr>
+    <tr><td>R2 <code>logs/</code></td><td>每约 1 分钟出现新 <code>.gz</code> 文件</td><td>检查 Logpush 任务是否启用</td></tr>
+    <tr><td>parse-queue / send-queue backlog</td><td>低且稳定</td><td>持续增长 → 查 Worker 日志 / 接收端可用性</td></tr>
+    <tr><td>parse-dlq / send-dlq</td><td>接近 0（自动排空）</td><td>只有<em>持续增长</em>的 DLQ 才需关注（不可处理的文件或接收端宕机）</td></tr>
+    <tr><td>R2 <code>processed/</code></td><td>不堆积</td><td>堆积 → Sender 未消费；查 Worker 日志</td></tr>
   </table>
 
-  <h3>指标解读指南</h3>
+  <h3>指标解读</h3>
   <table>
-    <tr><th>信号</th><th>含义</th><th>处理方式</th></tr>
-    <tr><td>Backlog = 0 + Lag &lt; 30s</td><td>系统实时消化，运行健康</td><td>正常，无需操作</td></tr>
-    <tr><td>Backlog 持续增长</td><td>消费速度跟不上生产速度，真正的瓶颈信号</td><td>检查 Worker 错误日志；必要时扩容</td></tr>
-    <tr><td><code>exceededResources</code> &gt; 0（Dashboard 显示 "Exceeded CPU"）</td><td>触发了某项单次 invocation 资源上限。<code>max_batch_size = 1</code>（每次只处理 1 文件）+ <code>cpu_ms = 300000</code> 已留出很大余量；可用 GraphQL 查 <code>cpuTimeP999</code> 看实际逼近程度</td><td>进入死信的消息会自动回灌；若某域名在超大文件上持续逼近上限，可单独上调其 <code>cpu_ms</code>（Enterprise 最大 300000）</td></tr>
-    <tr><td>Messages Retried &gt; 0</td><td>接收端不稳定</td><td>排查 5xx 子请求；确认接收端容量</td></tr>
-    <tr><td>DLQ &gt; 0（瞬时）</td><td>瞬时抖动期间属正常 —— Worker 会自动回灌</td><td>能自行排空的 DLQ 无需处理；只有持续增长才需排查（无法处理的文件 / 接收端宕机）</td></tr>
-    <tr><td>send-queue 积压持续增长</td><td>接收端变慢或不可用，或 send-queue <code>max_concurrency</code> 被人为压低</td><td>检查接收端延迟和错误率；确认 <code>max_concurrency</code> 未被压低（推荐留空 autoscale）</td></tr>
+    <tr><th>信号</th><th>含义</th><th>动作</th></tr>
+    <tr><td>backlog 低 + lag &lt; 30s</td><td>实时消费中</td><td>健康 —— 无需动作</td></tr>
+    <tr><td>backlog 持续增长</td><td>消费跟不上生产</td><td>查 Worker 错误与接收端时延</td></tr>
+    <tr><td>DLQ &gt; 0 但在排空</td><td>瞬时故障正在被自动回灌</td><td>无需动作</td></tr>
+    <tr><td>DLQ 持续增长</td><td>不可处理的文件或接收端宕机</td><td>检查该死信消息 / 接收端</td></tr>
+    <tr><td>send-queue backlog 增长</td><td>接收端慢/不可用，或 <code>max_concurrency</code> 被手动限低</td><td>查接收端；确认 <code>max_concurrency</code> 未设</td></tr>
   </table>
 
-  <h3>配置变更说明</h3>
+  <h3>变更方式</h3>
   <table>
-    <tr><th>变更类型</th><th>操作方式</th><th>是否需要重新部署</th></tr>
-    <tr><td>轮换 CTYUN_ENDPOINT / CTYUN_PRIVATE_KEY / CTYUN_URI_EDGE</td><td><code>wrangler secret put &lt;NAME&gt;</code></td><td>否，立即生效</td></tr>
-    <tr><td>修改 BATCH_SIZE / RAW_LOG_PREFIX / RAW_LOG_SUFFIX / LOG_LEVEL / 超时 / 回灌延迟</td><td>编辑 <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>是</td></tr>
-    <tr><td>更新 Worker 代码（<code>src/index.js</code>）</td><td><code>git push</code> → CI/CD 自动部署</td><td>是（CI/CD 处理）</td></tr>
-  </table>
-
-  <h3>设计依据与调参原理（为什么这样配置）</h3>
-  <p>以下为 2026-06 全量实测两账号 261 个域名后沉淀的调参依据，便于后续维护理解各参数取值；<code>wrangler.toml</code> 中不再赘述，日常部署只需照其顶部 PER-DOMAIN CHECKLIST 操作、参数保持默认。</p>
-  <table>
-    <tr><th>场景 / 现象</th><th>实测情况</th><th>对应设置</th></tr>
-    <tr>
-      <td>内存型 OOM（<code>exceededMemory</code>，已确认）</td>
-      <td>大行域名（如 id-upload / id-update，单行约 4KB）旧版 batch 并行解析时，峰值内存 = batch × 多份拷贝，多 invocation 撞同一 isolate → 超 128MB。</td>
-      <td><code>max_batch_size = 1</code>：一次只解析 1 个文件，把单次内存 / CPU / 子请求降到约 1/3。</td>
-    </tr>
-    <tr>
-      <td>大文件 / 资源密集型</td>
-      <td>asia-vcode-od / img / magazine 等单文件 7 万~10 万行（约 290MB），CPU 重（success cpuTime P99 ≈ 29–31s，约 id-upload 的 6 倍）。该批 DLQ 是 2026-06-02~05 的一次性事件（6/3 峰值），现已平息。<strong>确切触发未能锁定</strong>：当时 <code>exceededResources</code> 实测 cpuTime 仅 35–38s（未撞 60s）、wall &lt; 900s、子请求 &lt; 1000，均未撞已知硬限；观测日志被采样、metrics 已过保留期。故下列为<strong>降风险</strong>，非已证唯一根因。</td>
-      <td><code>max_batch_size = 1</code> + <code>cpu_ms = 300000</code>（Enterprise 上限）：对任何单次资源都留出大余量。</td>
-    </tr>
-    <tr>
-      <td>并发与吞吐</td>
-      <td>大域名（asia-vcode-od）实测需约 200 send 并发才能实时转发；Queue 并发上限为<strong>每队列 250</strong>（已查文档）；batch=1 后 parse 约需 42 并发，在 parse-queue 自己的 250 内、不与 send 抢。</td>
-      <td>两个主队列<strong>故意不设 <code>max_concurrency</code></strong>（交给 autoscaler）；DLQ 消费者设 <code>max_concurrency = 1</code>（死信量小，温和排空）。</td>
-    </tr>
-    <tr>
-      <td>cron 触发器与 handler 不配套</td>
-      <td>历史教训：脚本曾改为"纯事件驱动"并移除 <code>scheduled</code> handler，但遗留的 <code>* * * * *</code> 触发器仍每分钟触发 → 打到不存在的 handler → 每分钟 <code>scriptThrewException</code>（2026-06 复现）。</td>
-      <td>当前设计已恢复补扫：<code>scheduled()</code> 是真实的 reconciliation handler 且内部全程 <code>try/catch</code> 永不抛出，配 <code>[triggers] crons = ["* * * * *"]</code>。规则：触发器与 handler 必须配套——有 cron 就必须有不抛异常的 handler。</td>
-    </tr>
-    <tr>
-      <td>第 11 字段 server_ip</td>
-      <td>CF 的 <code>EdgeServerIP</code> 是「边缘→源站」内部 IP，仅回源请求才有值、cache 命中为空，并非对外服务 IP，与客户验证过的格式（固定 anycast VIP）不符。</td>
-      <td>第 11 字段取 <code>FIELD11_SERVER_IP</code>（客户在 wrangler 填该域名解析 / anycast IP，语义＝nginx <code>$server_addr</code>）；<strong>必填</strong>，为空则输出 <code>-</code>。</td>
-    </tr>
+    <tr><th>变更</th><th>方法</th><th>需重新部署？</th></tr>
+    <tr><td>轮换 secret</td><td><code>wrangler secret put &lt;NAME&gt;</code></td><td>否 —— 立即生效</td></tr>
+    <tr><td>改 <code>[vars]</code> 值或消费者设置</td><td>编辑 <code>wrangler.toml</code> → <code>wrangler deploy</code></td><td>是</td></tr>
+    <tr><td>更新 Worker 代码</td><td><code>git push</code> → GitHub Actions 部署</td><td>是（自动）</td></tr>
   </table>
 </section>
 
 </div>
 
 <footer>
-  Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN 日志对接技术参考 &nbsp;·&nbsp; 2026
+  Cloudflare Workers + R2 + Queues &nbsp;·&nbsp; CDN 日志对接参考
   <br><a href="mailto:dong@cloudflare.com" style="color:#666; text-decoration:none;">dong@cloudflare.com</a>
 </footer>
 

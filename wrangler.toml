@@ -1,127 +1,95 @@
-# ─── 基础配置（部署前请根据实际情况修改）────────────────────────────────────
-# name: Worker 名字，自定义，会显示在 CF Dashboard
-# account_id: 你的 Cloudflare Account ID，从 Dashboard 右上角或 `wrangler whoami` 获取
-name = "ctyun-logpush"
-account_id = "0297df3199a94c8082d099ac2212c40a"
-main = "src/index.js"           # 唯一入口：流式发送 (chunked) + 小并行池 + fetch 30s timeout
+# ═══════════════════════════════════════════════════════════════════════════
+#  ctyun-logpush-worker — 每个域名部署一份。
+#  带【按域名修改】/【按域名必填】标记的是每次部署要替换的项；其余保持默认即可。
+# ═══════════════════════════════════════════════════════════════════════════
+name = "ctyun-logpush"          # 【按域名修改】Worker 名，建议 <domain>-com-log
+account_id = "0297df3199a94c8082d099ac2212c40a"  # 【按域名修改】该域名所在的 Cloudflare Account ID
+main = "src/index.js"
 compatibility_date = "2026-03-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev  = false
 
-# ─── R2 存储桶（部署前必须确认/修改）─────────────────────────────────────────
-# bucket_name: 你在 CF R2 中创建的实际 bucket 名字
-# 同步修改下方 [vars] 里的 R2_BUCKET_NAME 保持一致
-# （binding = "RAW_BUCKET" 不要改，index.js 通过此 binding 访问 R2）
+# ─── R2 存储桶 ───────────────────────────────────────────────────────────────
+# binding = "RAW_BUCKET" 不要改（代码通过它访问 R2）。
+# bucket_name 按域名改，并与下方 [vars].R2_BUCKET_NAME 保持一致。
 [[r2_buckets]]
 binding     = "RAW_BUCKET"
-bucket_name = "cdn-logs-raw"
+bucket_name = "cdn-logs-raw"    # 【按域名修改】建议 <domain>-com
 
 # ─── Queue 生产者 ─────────────────────────────────────────────────────────────
-# 如需修改 Queue 名字：
-#   1. 修改下面两个 queue = "..." 为新名字
-#   2. 同步修改下方 consumers 里对应的 queue = "..." 为相同名字
-#   3. 同步修改 [vars] 里的 PARSE_QUEUE_NAME / SEND_QUEUE_NAME 为相同名字
-#   （binding = "PARSE_QUEUE" / "SEND_QUEUE" 不要改，index.js 通过此 binding 发消息）
+# binding 不要改。queue 名按域名改，并与下方 consumers、[vars].*_QUEUE_NAME 三处保持一致。
 [[queues.producers]]
 binding = "PARSE_QUEUE"
-queue   = "parse-queue"
+queue   = "parse-queue"         # 【按域名修改】建议 parse-queue-<domain>
 
 [[queues.producers]]
 binding = "SEND_QUEUE"
-queue   = "send-queue"
+queue   = "send-queue"          # 【按域名修改】建议 send-queue-<domain>
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# parse-queue：有界并发池(PARSE_PARALLELISM) + processFile 单次 R2 read 空闲超时(PARSE_READ_IDLE_TIMEOUT_MS) 配合。
-#   2026-06-18 实测(asia-vcode-od 同 ~95K backlog、并发同顶 250)：efac854 全并行 batch=3 仅 ~119/min——并发虽顶满，
-#   但大量 invocation 卡在挂死的 R2 read(avg wall 133s、p99 12.5min、甚至撞 15min 上限被杀)空耗并发槽。
-#   加【单次 read 空闲超时(45s 中断卡死读→重试该文件→释放槽)】+ 有界池(更轻/零 OOM) 后实测 ~260/min → 净排空。
-#   max_batch_size 须 ≥ PARSE_PARALLELISM 才喂满池(=1 退化串行)；且 max_batch_size×单文件CPU 须 < limits.cpu_ms(300s)。
-#   max_concurrency 不设：由 autoscaler 按 backlog 自由扩(上限 250)，保证大流量域名吞吐。
+# 同一个 Worker 同时消费这 4 个队列：parse / send / parse-dlq / send-dlq。
+# parse：单次 invocation 内并行解析 PARSE_PARALLELISM 个文件（max_batch_size 须 ≥ 该值）。
 [[queues.consumers]]
-queue              = "parse-queue"   # 必须与上方 producers parse-queue 名字一致
-max_batch_size     = 2               # 须 ≥ PARSE_PARALLELISM；2026-06 实测 2 比 3 周转更快、零 OOM
+queue              = "parse-queue"   # 【按域名修改】与上方 producer 一致
+max_batch_size     = 2
 max_batch_timeout  = 5
-max_retries        = 5               # 耗尽后进 parse-dlq，再由 handleDlqRedrive 自动延迟回灌（不丢）
-dead_letter_queue  = "parse-dlq"
+max_retries        = 5               # 超过后进 parse-dlq，由 DLQ 重驱动自动回灌
+dead_letter_queue  = "parse-dlq"     # 【按域名修改】建议 parse-dlq-<domain>
 
-# send-queue：max_concurrency 不设(=2f1a6d3 行为，autoscaler 自由扩，保证 od 大 send 量吞吐)。
-#   .done 标记保证重复投递不会重复 POST。
+# send：单次 invocation 取多个待发批次，内部用 SEND_PARALLELISM 小并发池发送。
 [[queues.consumers]]
-queue              = "send-queue"    # 必须与上方 producers send-queue 名字一致
-max_batch_size     = 50              # 单次最多取 50 条；同一 batch 内小并行池(SEND_PARALLELISM)
+queue              = "send-queue"    # 【按域名修改】与上方 producer 一致
+max_batch_size     = 50
 max_batch_timeout  = 5
-max_retries        = 5
-dead_letter_queue  = "send-dlq"
+max_retries        = 5               # 超过后进 send-dlq，由 DLQ 重驱动自动回灌
+dead_letter_queue  = "send-dlq"      # 【按域名修改】建议 send-dlq-<domain>
 
-# ─── DLQ 自动重驱动消费者（核心修复：消除「进 DLQ 就永久滞留」）──────────────────
-# 让本 worker 同时消费 parse-dlq / send-dlq；index.js 的 handleDlqRedrive 会把死信消息
-#   以「指数退避 + 抖动」的延迟回灌到各自源队列，全自动恢复，无需人工、无需告警。
-#   重驱动安全（不重复）：依赖确定性 batchKey + .done 标记，重解析时已发批次自动跳过。
-# 注意：DLQ consumer 本身【不设 dead_letter_queue】——避免衍生出 parse-dlq-dlq 无限套娃；
-#   重驱动 handler 极轻（仅 send+ack），失败则原地重试（max_retries 给高一些）。
-# max_concurrency=1：死信量小且重驱动开销低，温和排空即可，不与主管线抢并发。
+# parse-dlq / send-dlq：本 Worker 消费它们，把死信按指数退避+抖动回灌源队列；自身不设 dead_letter_queue。
 [[queues.consumers]]
-queue              = "parse-dlq"     # 必须与 parse-queue 的 dead_letter_queue 一致；[vars].PARSE_DLQ_NAME 同步
+queue              = "parse-dlq"     # 【按域名修改】与 parse-queue 的 dead_letter_queue 一致
 max_batch_size     = 10
 max_batch_timeout  = 30
 max_retries        = 10
 max_concurrency    = 1
 
 [[queues.consumers]]
-queue              = "send-dlq"      # 必须与 send-queue 的 dead_letter_queue 一致；[vars].SEND_DLQ_NAME 同步
+queue              = "send-dlq"      # 【按域名修改】与 send-queue 的 dead_letter_queue 一致
 max_batch_size     = 10
 max_batch_timeout  = 30
 max_retries        = 10
 max_concurrency    = 1
 
 # ─── 环境变量 ─────────────────────────────────────────────────────────────────
-# PARSE_QUEUE_NAME / SEND_QUEUE_NAME / PARSE_DLQ_NAME / SEND_DLQ_NAME 必须与上方对应
-#   queue = "..." 的名字完全一致；index.js 通过这四个变量识别消息来自哪个 queue（含两个 DLQ）。
-#   ⚠️ 多域名部署：每个域名把这 4 个名字 + 上方 4 个 consumer 的 queue + producer 的 queue
-#      统一替换为带域名后缀的名字（如 parse-queue-<domain> / parse-dlq-<domain>），保持一一对应。
-#
-# PUSH_START_TIME：统一时间点推送控制（一个变量，两种模式）
-#   - 空字符串（默认）：不过滤，正常处理所有日志
-#   - 未来时间：到达该时间点后自动开始推送，之前的日志静默跳过
-#   - 过去时间：部署后 1 分钟内自动扫描 R2 补传历史文件，同时继续推送新日志
-#   - 格式：ISO 8601，例如 "2026-04-15T10:00:00Z"（UTC）或 "2026-04-15T18:00:00+08:00"（北京时间）
-# FIELD11_SERVER_IP：EdgeServerIP 为空时的兜底值；为空时输出 "-"
-# SEND_FETCH_TIMEOUT_MS：单次发送 fetch 超时（默认 30000=30s，范围 1000~60000）。接收端慢时尽快 abort
-#   重试，减少慢发送在 isolate 内堆积内存（OOM 触发链）。
-# RETRY_DELAY_SECONDS：parser/sender 失败重试的延迟秒数（默认 30）。只延迟失败的少数，不拖慢成功路径。
-# REDRIVE_BASE/MAX/JITTER_DELAY_SECONDS：DLQ 重驱动回灌延迟的「指数退避基数/封顶/抖动」（默认 60/3600/30）。
+# 4 个队列名必须与上方 producers / consumers 的 queue 名一一对应。
+# FIELD11_SERVER_IP 每个域名各自填；其余变量都有合理默认，一般无需改动。
 [vars]
-PARSE_QUEUE_NAME = "parse-queue"
-SEND_QUEUE_NAME  = "send-queue"
-PARSE_DLQ_NAME   = "parse-dlq"       # 必须与 parse-queue 的 dead_letter_queue 及 DLQ consumer 一致
-SEND_DLQ_NAME    = "send-dlq"        # 必须与 send-queue 的 dead_letter_queue 及 DLQ consumer 一致
-R2_BUCKET_NAME   = "cdn-logs-raw"   # 必须与上方 [[r2_buckets]] bucket_name 完全一致
-BATCH_SIZE       = "2000"            # 每批 2000 行。⚠️ 改此值前须先清空 DLQ：否则破坏 .done 幂等(index→行区间错位)
-RAW_LOG_PREFIX   = "logs/"          # 仅处理匹配此前缀的 R2 原始日志对象
-RAW_LOG_SUFFIX   = ".log.gz"        # 仅处理匹配此后缀的 R2 原始日志对象
+PARSE_QUEUE_NAME = "parse-queue"     # 【按域名修改】= 上方 parse 队列名
+SEND_QUEUE_NAME  = "send-queue"      # 【按域名修改】= 上方 send 队列名
+PARSE_DLQ_NAME   = "parse-dlq"       # 【按域名修改】= parse-queue 的 dead_letter_queue
+SEND_DLQ_NAME    = "send-dlq"        # 【按域名修改】= send-queue 的 dead_letter_queue
+R2_BUCKET_NAME   = "cdn-logs-raw"   # 【按域名修改】= 上方 [[r2_buckets]] bucket_name
+BATCH_SIZE       = "2000"            # 每批行数（每批一次 POST）。改此值前先清空 DLQ，避免破坏 .done 幂等
+RAW_LOG_PREFIX   = "logs/"          # 只处理此前缀的 R2 原始日志对象
+RAW_LOG_SUFFIX   = ".log.gz"        # 只处理此后缀的 R2 原始日志对象
 LOG_LEVEL        = "info"
-PUSH_START_TIME  = ""
-FIELD11_SERVER_IP = ""
-SEND_PARALLELISM = "2"               # 单次 invocation 内的小并行度（1=串行；建议 2；上限软限制 8）
-PARSE_PARALLELISM = "2"              # parse 单 invocation 内并行【解析】文件数（有界池；须 ≤ parse max_batch_size；上限 8；1=串行）
-PARSE_READ_IDLE_TIMEOUT_MS = "45000" # 单次 R2 read() 空闲超时(ms)；卡死才触发(与对象大小无关)，超时只重试该文件、释放并发槽。0=不限
-SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)，默认 30s
-RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)，只影响失败的少数
+PUSH_START_TIME  = ""                # 留空=推送全部新日志。未来时间=到点开始推；过去时间=部署后扫 R2 补传历史（ISO 8601）
+FIELD11_SERVER_IP = ""               # 【按域名必填】该域名的 anycast/解析 IP，写入日志第 11 字段 server_ip；留空则输出 "-"
+SEND_PARALLELISM = "2"               # send 单次 invocation 内并发 POST 数（1=串行；上限 8）
+PARSE_PARALLELISM = "2"              # parse 单次 invocation 内并行解析文件数（须 ≤ parse max_batch_size；上限 8）
+PARSE_READ_IDLE_TIMEOUT_MS = "45000" # 单次 R2 read() 空闲超时(ms)，超时只重试该文件；0=不限
+SEND_FETCH_TIMEOUT_MS = "30000"      # 单次发送 fetch 超时(ms)
+RETRY_DELAY_SECONDS = "30"           # 失败重试延迟(s)
 REDRIVE_BASE_DELAY_SECONDS = "60"    # DLQ 重驱动退避基数(s)
 REDRIVE_MAX_DELAY_SECONDS  = "3600"  # DLQ 重驱动退避封顶(s)
-REDRIVE_JITTER_SECONDS     = "30"    # DLQ 重驱动抖动(s)，防 thundering herd
+REDRIVE_JITTER_SECONDS     = "30"    # DLQ 重驱动抖动(s)
 
 # ─── Cron 触发器 ─────────────────────────────────────────────────────────────
-# 每分钟触发一次 scheduled handler，用于检查是否需要触发历史日志补传
-# 补传仅在 PUSH_START_TIME 为过去时间且未执行过时触发，其他情况秒级返回
+# 每分钟触发 scheduled handler；仅当 PUSH_START_TIME 为过去时间且未执行过时扫描补传，其余情况秒级返回。
 [triggers]
 crons = ["* * * * *"]
 
 # ─── Observability（Workers Logs）─────────────────────────────────────────────
-# enabled = true：顶层总开关；不设或为 false 时新版统一 Logs 不会持久化数据，
-#                  控制台 Logs 面板将显示为空，事故时无法回看 invocation 上下文。
-# head_sampling_rate = 1：100% 采样（不抽样），生产事故诊断需要完整数据。
-#                         数据保留遵循 CF 默认策略（当前约 3 天）。
+# 100% 采样，便于回看 invocation 上下文（数据按 CF 默认策略保留）。
 [observability]
 enabled = true
 head_sampling_rate = 1
@@ -130,8 +98,6 @@ enabled         = true
 invocation_logs = true
 
 # ─── CPU 时间上限 ─────────────────────────────────────────────────────────────
-# 默认 30 秒，Enterprise 最高可提至 5 分钟（300000）。
-# 设 300000(ENT 上限)：全并行 batch=3 时一个 invocation 会累加最多 3 个大文件的 CPU，给足余量。
-# 适配大流量客户场景：6000+ req/s 产生的 Logpush 单文件可能接近 100K 行。
+# Enterprise 上限 5 分钟（300000ms）；流式解析单次 CPU 远低于此，留足余量。
 [limits]
 cpu_ms = 300000

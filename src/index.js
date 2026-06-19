@@ -22,25 +22,21 @@
  *        若接收端只接受 Content-Length 固定长度请求体，会返回 400/411/415。
  *
  *  超时防御：
- *    fetch() 设置 AbortSignal.timeout(60_000)。客户端 hang 时单次 fetch 最多 60s
- *    会被中断 → 抛 AbortError → 外层 catch 触发 msg.retry()。
- *    防止单 invocation 撑满 Queue consumer 的 15 分钟 wall time 上限。
+ *    每次发送 fetch() 设置 SEND_FETCH_TIMEOUT_MS 超时；接收端 hang 时单次 fetch 被中断 →
+ *    抛 AbortError → 外层 catch 触发 msg.retry()，避免单 invocation 撑满 Queue 的 15 分钟上限。
  *
  *  关键机制：
- *    - PUSH_START_TIME 时间过滤（未来/过去双模式）
- *    - Scheduled handler 自动补传（一次性 + 幂等 marker）
- *    - send-queue 同 batch 内串行 + .done 标记保证 at-least-once 幂等
- *    - Queue send 失败回滚 R2 临时文件
- *    - resp.body.cancel() 防 stalled HTTP response
- *    - delete 失败不抛异常（R2 lifecycle 兜底）
- *    - DLQ 自动重驱动：worker 同时消费 parse-dlq / send-dlq，把死信消息以
- *      指数退避+抖动的延迟回灌到各自源队列，全自动恢复，无需人工/告警。
- *      依赖确定性 batchKey + .done 标记保证重驱动不产生重复（适配无去重接收端）。
- *    - 源级 .done 幂等早退 + parse 有界并发池：同一原始对象被重复投递（含旧 reconcile 重灌）时，
- *      靠一次 HEAD 秒级跳过、不重解析；解析吞吐由 PARSE_PARALLELISM 有界池提升，零 OOM、全域可部署。
- *    - parse 单次 R2 read() 空闲超时(PARSE_READ_IDLE_TIMEOUT_MS，默认45s)：卡死的 R2 流(实测 900~1922s
- *      I/O 挂死，会占满 250 并发槽把吞吐拖到 ~119/min)在 45s 后中断并重试【该文件】→ 释放 invocation 槽、
- *      吞吐恢复(实测 ~260/min)。每次 read 重新计时、与对象大小无关，不会误杀大文件；不丢数据(只重试该文件)。
+ *    - 幂等：确定性 batchKey + .done 标记 → 重复投递不会重复 POST（接收端无需去重）；
+ *      源级 .done 让已完整处理过的原始对象直接跳过、不重解析。
+ *    - parse 有界并发池：单次 invocation 内最多 PARSE_PARALLELISM 个文件并行解析，每个文件流式 +
+ *      每 BATCH_SIZE 行 flush → 峰值内存受 BATCH_SIZE 限、与文件大小无关。
+ *    - 单次 R2 read() 空闲超时（PARSE_READ_IDLE_TIMEOUT_MS）：卡死的读在超时后中断、只重试该文件，
+ *      不挡同批其他文件；空闲口径、与对象大小无关。
+ *    - DLQ 自动重驱动：worker 同时消费 parse-dlq / send-dlq，把死信以指数退避+抖动回灌源队列，
+ *      靠 .done 幂等保证不重复，全自动恢复、无需人工/告警。
+ *    - 发送：resp.body.cancel() 防 stalled HTTP response；delete 失败不抛异常（R2 lifecycle 兜底）；
+ *      Queue send 失败回滚 R2 临时文件。
+ *    - PUSH_START_TIME 时间过滤（未来/过去双模式）+ Scheduled handler 历史补传（一次性 + 幂等 marker）。
  *
  *  Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  *  Env Vars    : BATCH_SIZE, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
@@ -116,7 +112,7 @@ const IATA_TO_COUNTRY = Object.freeze({
   'ALA':'KZ','TAS':'UZ','GYD':'AZ','TBS':'GE','EVN':'AM',
   'MLA':'MT','LCA':'CY','TGD':'ME',
   'GUM':'GU','NAN':'FJ','POM':'PG','MLE':'MV',
-  // Additional active POP airport codes verified against Zinc production data (2026-05)
+  // Additional active POP airport codes
   'AAE':'DZ','ABJ':'CI','ACX':'CN','AGR':'IN','AKX':'KZ','ANC':'US',
   'AQG':'CN','ARI':'CL','ARU':'BR','ASK':'CI','AVA':'CN','BAQ':'CO',
   'BBI':'IN','BDQ':'IN','BEL':'BR','BEY':'LB','BGI':'BB','BGR':'US',
@@ -200,19 +196,11 @@ export default {
 // ─── Parser: R2原始文件 → 流式解析转换 → R2临时文件 → send-queue ───────────
 async function handleParseQueue(batch, env) {
   // 有界并发池：单次 invocation 内最多 PARSE_PARALLELISM 个文件并行解析（默认 1=串行；[vars] 设 2）。
-  // 为何是有界池而非「整批全并行」（2026-06-18 实测对比 asia-vcode-od，同一 ~95K backlog、并发同样顶 250）：
-  //   - 整批全并行 batch=3：单 invocation 同时持有 3 个文件的解析态、更重更长 → 完成的 invocation 反而更少，
-  //     实测有效处理仅 ~150 对象/min，且部署瞬间偶发 128MB OOM（大行域名更严重）。
-  //   - 有界池 batch=2 / P=2：单 invocation 更轻、周转更快、零 OOM → 全域可安全部署。
-  // ⚠️ 但吞吐能否真正排空，关键还在 processFile 里的【单次 R2 read 空闲超时】：2026-06-18 实测 efac854 在
-  //    并发已顶满 250 的情况下仍只有 ~119/min——因为大量 invocation 卡在挂死的 R2 read 上(avg wall 133s、
-  //    p99 12.5min、甚至撞 15min 上限被杀)，并发槽被空耗。空闲超时(45s)中断卡死读、释放槽后实测 ~260/min。
-  //    故「有界池(轻/零OOM) + 单次read空闲超时(释放卡死槽)」两者配合，才把 ~119→~260/min、净排空 backlog。
   // 内存安全：同一时刻最多 P 个文件在解析，每个仍是流式 + 每 BATCH_SIZE 行 flush →
-  //   峰值内存 ≈ P × 单文件批次(~数 MB)，与对象大小无关，远低于 128MB（大行域名 id-upload 同样安全）。
-  // CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件CPU，须 < limits.cpu_ms(300s)，故 max_batch_size 不宜过大。
-  // 横向扩：invocation 数量仍由 autoscaler 按 backlog 扩（每队列上限 250）。
-  // ⚠️ 需 wrangler 的 parse consumer max_batch_size ≥ PARSE_PARALLELISM，池才有多文件可并行（=1 退化串行）。
+  //   峰值内存 ≈ P × 单文件批次，与对象大小无关，远低于 128MB。
+  // CPU 安全：单 invocation 总 CPU ≈ max_batch_size × 单文件 CPU，须 < limits.cpu_ms。
+  // 横向扩：invocation 数量由 autoscaler 按 backlog 扩（每队列上限 250）。
+  // ⚠️ wrangler 的 parse consumer max_batch_size 须 ≥ PARSE_PARALLELISM，池才有多文件可并行（=1 退化串行）。
   // processFile 内部自行 ack/retry，单文件失败不影响同批其他文件。
   const pool = (() => {
     const n = Number(env?.PARSE_PARALLELISM);
@@ -232,19 +220,16 @@ async function handleParseQueue(batch, env) {
 }
 
 // ─── DLQ 自动重驱动消费者 ────────────────────────────────────────────────────
-// 设计目标（全自动、无人工、无告警）：
-//   进入 parse-dlq / send-dlq 的死信消息不再永久滞留，而是以「指数退避 + 抖动」的延迟
-//   回灌到各自源队列（parse-queue / send-queue），交给正常的幂等管线重新处理。
-// 为什么安全（不产生重复，适配无去重接收端）：
+// 进入 parse-dlq / send-dlq 的死信，以「指数退避 + 抖动」的延迟回灌到各自源队列
+//   （parse-queue / send-queue），交给正常的幂等管线重新处理，全自动、无需人工/告警。
+// 为什么不产生重复（适配无去重接收端）：
 //   - Parser 的 batchKey 是确定性的（processed/<safeKey>-<index>.txt），Sender 成功后写 .done 标记。
 //   - 重驱动 → 重解析 → 已发送批次撞 .done 跳过 → 只补发从未发出的尾部 → 零重复。
-//   - 前提：BATCH_SIZE 不变（否则 index→行区间 错位会破坏 .done 匹配）。修改 BATCH_SIZE 须先清空 DLQ。
+//   - 前提：BATCH_SIZE 不变（否则 index→行区间错位会破坏 .done 匹配）。修改 BATCH_SIZE 须先清空 DLQ。
 // 行为：
-//   - 瞬时型失败（并发 OOM、端点抖动）：延迟后再试通常即成功，自愈。
-//   - 真正的「毒消息」：__redrive 计数驱动退避逐次拉长（封顶 REDRIVE_MAX_DELAY_SECONDS），
-//     退化为低频无害循环，不烧资源、不需人工介入。
-//   - 抖动避免一次性大量死信同时回灌造成 thundering herd。
-// 普适：随模板部署到所有域名后，自动清空各自的 DLQ，无需逐域名打补丁。
+//   - 瞬时失败：延迟后再试通常即成功，自愈。
+//   - 毒消息：__redrive 计数驱动退避逐次拉长（封顶 REDRIVE_MAX_DELAY_SECONDS），退化为低频无害循环。
+//   - 抖动避免大量死信同时回灌造成 thundering herd。
 async function handleDlqRedrive(batch, env, targetQueue, targetName, label) {
   // 绑定缺失时（误配置）：不丢消息，整批重试，等待修复
   if (!targetQueue) {
@@ -295,11 +280,10 @@ async function processFile(msg, env) {
 
   // ─── 源级 .done 幂等早退 ───────────────────────────────────────────────────
   // 该原始对象已被完整处理过（写过源级 .done 标记）→ 一次 HEAD 命中即 ack 跳过，不重解析。
-  // 关键收益：当前 backlog 里同一对象被旧 reconcile 重灌了几十次；第 1 份完成后写下 .done，
-  //   其余重复份在此秒级跳过 → backlog 快速塌缩、又不丢真实未处理对象（首份仍会完整解析投递）。
+  //   （应对重复投递：同一对象被多次入队时，只有第一份做完整解析，其余秒级跳过。）
   // 标记键 `${key}.done` 落在 logs/ 下但以 .done 结尾（非 .log.gz），不会被当作原始日志再次触发/解析。
   // 安全边界：源级 .done 仅在【所有批次都已成功入 send-queue】之后才写（见下方）；
-  //   即便 .done 误失/漏写，批次级 .done 仍是「不重复发送」的最终保证。
+  //   即便 .done 漏写，批次级 .done 仍是「不重复发送」的最终保证。
   const sourceDoneKey = `${key}.done`;
   if (await env.RAW_BUCKET.head(sourceDoneKey).catch(() => null)) {
     log(env, 'info', `Source already processed (skip): ${key}`);
@@ -328,9 +312,9 @@ async function processFile(msg, env) {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseIntegerVar(env, 'BATCH_SIZE', DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
-    // 单次 R2 read() 空闲超时：健康流每几百 ms 出块、永不触发；只有【单次读卡死】(实测见过 900~1922s I/O 挂死，
-    // 会占满 250 并发槽、把吞吐拖到 ~119/min)才超时 → 抛错 → 下方 catch 对【这一个文件】msg.retry
-    // (只重试该文件、不挡同批后续、不丢数据；释放 invocation 槽 → 吞吐恢复)。阈值与对象大小无关 → 全域统一。
+    // 单次 R2 read() 空闲超时：健康流每几百 ms 出块、永不触发；只有单次读卡死才超时 → 抛错 →
+    // 下方 catch 对【这一个文件】msg.retry（只重试该文件、不挡同批后续、不丢数据）。
+    // 空闲口径（每次 read 重新计时），与对象大小无关 → 全域统一一个值，不会误杀大文件。
     const idleTimeoutMs = parseIntegerVar(env, 'PARSE_READ_IDLE_TIMEOUT_MS', DEFAULT_PARSE_READ_IDLE_MS, 0, 600000);
     let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, parseErrCount = 0, skipped = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
@@ -368,7 +352,7 @@ async function processFile(msg, env) {
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
-    // 延迟重试：给「并发型瞬时 OOM / R2 抖动」等留出恢复时间；耗尽 max_retries 后进 parse-dlq，
+    // 延迟重试：给瞬时失败（R2 抖动等）留出恢复时间；耗尽 max_retries 后进 parse-dlq，
     // 再由 handleDlqRedrive 自动延迟回灌，最终自愈（不会永久丢失）。
     msg.retry({ delaySeconds: retryDelaySeconds(env) });
   }
@@ -464,10 +448,8 @@ async function sendBatchUnlocked(key, env) {
   //   说明接收端不支持 chunked 请求体，需协调客户端启用。
   const compressedStream = object.body.pipeThrough(new CompressionStream('gzip'));
 
-  // 单次 fetch 超时（默认 30s，可配）：客户端 hang 时尽快 abort → 外层 catch → msg.retry() 接管。
-  // 作用有二：①缩短「慢发送滞留」时间，降低同一 isolate 内并发发送的内存堆积（OOM 触发链）；
-  //          ②保证最坏情况下单 invocation wall = (max_batch_size / SEND_PARALLELISM) × 超时 仍 < 15min 上限。
-  // 默认从历史的 60s 收紧到 30s（接收端慢时 durationP99 曾逼近 60s）。Enterprise 接收端正常应远快于此。
+  // 单次 fetch 超时（SEND_FETCH_TIMEOUT_MS）：接收端 hang 时尽快 abort → 外层 catch → msg.retry() 接管。
+  // 作用：缩短慢发送滞留时间、降低并发发送的内存堆积，并保证单 invocation wall 不撑满 Queue 的 15min 上限。
   const sendTimeoutMs = parseIntegerVar(env, 'SEND_FETCH_TIMEOUT_MS', 30000, 1000, 60000);
   const fetchInit = {
     method: 'POST',
@@ -500,10 +482,10 @@ async function streamParseNdjsonGzip(inputStream, onRecord, onParseError, idleTi
   const decoder = new TextDecoder('utf-8');
   let   buffer  = '';
   // idleTimeoutMs>0：给【每一次 reader.read()】设空闲超时（不是整文件总时限）。
-  // 健康的 R2 流每几百毫秒就产出一块数据，永远不会触发；只有「单次读卡死」（连接挂住，
-  // 实测纯 I/O 等待 900~1922s）才会触发 → 抛错 → 上层对该文件 msg.retry。
-  // 关键：阈值与对象大小【无关】（大文件也是连续出块），可全域统一一个值、不会误杀大文件。
-  // 每次循环重新计时（空闲口径）。0=不限（旧默认行为）。
+  // 健康的 R2 流每几百毫秒就产出一块数据，永远不会触发；只有「单次读卡死」（连接挂住）
+  // 才会触发 → 抛错 → 上层对该文件 msg.retry。
+  // 阈值与对象大小【无关】（大文件也是连续出块），可全域统一一个值、不会误杀大文件。
+  // 每次循环重新计时（空闲口径）。0=不限。
   try {
     while (true) {
       let res;
